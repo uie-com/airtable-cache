@@ -38,7 +38,7 @@ export async function GET(request: NextRequest) {
     }
 
     const url = `https://api.airtable.com/${path.join("/")}?${params}`;
-    console.log("\n\n[API] Request: " + decodeURIComponent(url));
+    console.log("\n\n----------\n[API] Request: " + decodeURIComponent(url));
 
     let data: any;
 
@@ -47,8 +47,8 @@ export async function GET(request: NextRequest) {
     }
 
     if (cache[referrer]?.[url] && !(refresh === 'true')) {
-        console.log("\n[API] Cache hit for URL:", decodeURIComponent(url));
         data = cache[referrer][url];
+        console.log("\n[API] Cache hit for URL:", decodeURIComponent(url), "\n--  Records:", data.records ? data.records.length : 'N/A', '/n');
 
         const lastUpdated = timestamps[referrer][url] || 0;
         if (Date.now() - lastUpdated > REFRESH_INTERVAL)
@@ -85,7 +85,7 @@ export async function GET(request: NextRequest) {
 
     saveCache(referrer);
 
-    console.log("[API] Response: ", response.status);
+    console.log("[API] Response: ", response.status, "\n--  Records:", data.records ? data.records.length : 'N/A', '/n');
 
     if (searchParams.has('offset')) {
         console.log("[API] Response includes 'offset' for pagination.");
