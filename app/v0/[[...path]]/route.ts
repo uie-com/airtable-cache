@@ -150,8 +150,8 @@ async function loadCache(referrerHostname: string) {
     const cacheFilePath = path.join(process.cwd(), 'public', 'cache-' + referrerHostname + '.js');
 
     if (fs.existsSync(cacheFilePath)) {
-        const fileContent = fs.readFileSync(cacheFilePath, 'utf8');
-        const jsonString = fileContent.substring(PREFIX.length, fileContent.length - SUFFIX.length).trim();
+        const fileContent = fs.readFileSync(cacheFilePath, 'utf8') as string;
+        const jsonString = fileContent.substring(PREFIX.length, fileContent.lastIndexOf('}')).trim();
         console.log("Trimmed JSON string:", jsonString); // Log the trimmed JSON string for debugging
         const loadedCache = JSON.parse(jsonString);
 
