@@ -137,12 +137,12 @@ Create `.env.local` in the project root:
    ```bash
    npm run dev
    # Then call it like you'd call Airtable (append ?ref=<slug>):
-   curl "http://localhost:3000/app/v0/appXXXXXXXX/tblYYYYYYYY?maxRecords=1&ref=my-site"
+   curl "http://localhost:4444/app/v0/appXXXXXXXX/tblYYYYYYYY?maxRecords=1&ref=my-site"
    ```
 
 4. Add the preload script to your site  
    ```html
-   <script type="module" src="http://localhost:3000/cache-my-site.js"></script>
+   <script type="module" src="http://localhost:4444/cache-my-site.js"></script>
    ```
 
 ## 🧩 Integration Tips
