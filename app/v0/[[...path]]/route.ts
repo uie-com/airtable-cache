@@ -1,8 +1,8 @@
 import { NextRequest } from "next/server";
 
 const AIRTABLE_API_KEY = process.env.AIRTABLE_API_KEY;
-const REFRESH_INTERVAL = 5 * 60 * 1000; // 5 minutes
-const FORGET_INTERVAL = 24 * 60 * 60 * 1000; // 24 hours
+const REFRESH_INTERVAL = 15 * 60 * 1000; // 15 minutes
+const FORGET_INTERVAL = 7 * 24 * 60 * 60 * 1000; // 7 days
 
 let cache: { [referrer: string]: { [url: string]: any } } = {};
 let timestamps: { [referrer: string]: { [url: string]: number } } = {};
@@ -43,8 +43,7 @@ export async function GET(request: NextRequest) {
     let data: any;
 
     if (!cache[referrer]) {
-        cache[referrer] = {};
-        timestamps[referrer] = {};
+        loadCache(referrer);
     }
 
     if (cache[referrer][url] && !(refresh === 'true')) {
@@ -83,6 +82,11 @@ export async function GET(request: NextRequest) {
 
     console.log("[API] Response: ", response.status);
 
+    if (searchParams.has('offset')) {
+        console.log("[API] Response includes 'offset' for pagination.");
+        mergePaginatedData(referrer);
+    }
+
     return new Response(JSON.stringify(data),
         {
             status: response.status,
@@ -93,9 +97,44 @@ export async function GET(request: NextRequest) {
     );
 }
 
+async function mergePaginatedData(referrerHostname: string) {
+    const offsetStarts = Object.keys(cache[referrerHostname]).map(url => {
+        const data = cache[referrerHostname][url];
+        return data.offset ? { url, offset: data.offset, data: data } : null;
+    }).filter(Boolean);
+
+    const offsetEnds = Object.keys(cache[referrerHostname]).map(url => {
+        const data = cache[referrerHostname][url];
+        const queryParams = new URL(url).searchParams;
+        return queryParams.has('offset') ? { url, offset: queryParams.get('offset'), data: data } : null;
+    }).filter(Boolean);
+
+    for (const start of offsetStarts) {
+        if (!start) continue;
+
+        const end = offsetEnds.find(req => req?.offset === start.offset);
+        if (!end) continue;
+
+        console.log("[API] Backfilling paginated data and deleting request:", end.url);
+        if (start.data.records && end.data.records) {
+            start.data.records = start.data.records.concat(end.data.records);
+            start.data.offset = end.data.offset || undefined;
+
+            delete cache[referrerHostname][end.url];
+            delete timestamps[referrerHostname][end.url];
+
+            cache[referrerHostname][start.url] = start.data;
+
+            saveCache(referrerHostname);
+        }
+    }
+}
+
+const PREFIX = 'export const cache = ';
+const SUFFIX = ';\nwindow.airtableCache = cache;';
+
 async function saveCache(referrerHostname: string) {
-    const cacheString = `export const cache = ${JSON.stringify(cache[referrerHostname])};
-    window.airtableCache = cache;`;
+    const cacheString = PREFIX + JSON.stringify(cache[referrerHostname]) + SUFFIX;
 
     const fs = require('fs');
     const path = require('path');
@@ -103,6 +142,31 @@ async function saveCache(referrerHostname: string) {
 
     fs.writeFileSync(cacheFilePath, cacheString, 'utf8');
     console.log("[API] Cache saved to", cacheFilePath);
+}
+
+async function loadCache(referrerHostname: string) {
+    const fs = require('fs');
+    const path = require('path');
+    const cacheFilePath = path.join(process.cwd(), 'public', 'cache-' + referrerHostname + '.js');
+
+    if (fs.existsSync(cacheFilePath)) {
+        const fileContent = fs.readFileSync(cacheFilePath, 'utf8');
+        const jsonString = fileContent.replace(PREFIX, '').replace(SUFFIX, '');
+        const loadedCache = JSON.parse(jsonString);
+
+        cache[referrerHostname] = loadedCache;
+        timestamps[referrerHostname] = {};
+
+        for (const url in cache[referrerHostname]) {
+            timestamps[referrerHostname][url] = Date.now();
+        }
+
+        console.log("[API] Cache loaded from", cacheFilePath);
+    } else {
+        cache[referrerHostname] = {};
+        timestamps[referrerHostname] = {};
+        console.log("[API] No existing cache file found for", referrerHostname);
+    }
 }
 
 async function refreshCache(url: string, referrerHostname: string) {
