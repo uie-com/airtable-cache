@@ -54,6 +54,11 @@ export async function GET(request: NextRequest) {
         if (Date.now() - lastUpdated > REFRESH_INTERVAL)
             refreshCache(url, referrer);
 
+        if (searchParams.has('offset')) {
+            console.log("[API] Response includes 'offset' for pagination.");
+            mergePaginatedData(referrer);
+        }
+
         return new Response(JSON.stringify(data), {
             status: 200,
             headers: {
@@ -152,7 +157,6 @@ async function loadCache(referrerHostname: string) {
     if (fs.existsSync(cacheFilePath)) {
         const fileContent = fs.readFileSync(cacheFilePath, 'utf8') as string;
         const jsonString = fileContent.substring(PREFIX.length, fileContent.lastIndexOf('}') + 1).trim();
-        console.log("Trimmed JSON string:", jsonString); // Log the trimmed JSON string for debugging
         const loadedCache = JSON.parse(jsonString);
 
         cache[referrerHostname] = loadedCache;
@@ -171,6 +175,13 @@ async function loadCache(referrerHostname: string) {
 }
 
 async function refreshCache(url: string, referrerHostname: string) {
+    const searchParams = new URL(url).searchParams;
+
+    if (searchParams.has('offset')) {
+        console.log("[API] Skipping refresh for paginated request:", decodeURIComponent(url));
+        return;
+    }
+
     const response = await fetch(url, {
         headers: {
             Authorization: `Bearer ${AIRTABLE_API_KEY}`,
@@ -184,6 +195,39 @@ async function refreshCache(url: string, referrerHostname: string) {
         cache[referrerHostname][url] = data;
         timestamps[referrerHostname][url] = Date.now();
         console.log("[API] Cache refreshed for URL:", decodeURIComponent(url));
+    }
+
+    if (Object.keys(data).includes('offset')) {
+        let nextOffset = data.offset;
+
+        while (nextOffset) {
+            console.log("[API] Refreshed response includes 'offset' for pagination. Continuing fetching.");
+
+            const paginatedUrl = new URL(url);
+            paginatedUrl.searchParams.set('offset', nextOffset);
+
+            const paginatedResponse = await fetch(paginatedUrl.toString(), {
+                headers: {
+                    Authorization: `Bearer ${AIRTABLE_API_KEY}`,
+                    "Content-Type": "application/json",
+                },
+            });
+
+            const paginatedData = await paginatedResponse.json();
+
+            if (paginatedResponse.ok) {
+                cache[referrerHostname][paginatedUrl.toString()] = paginatedData;
+                timestamps[referrerHostname][paginatedUrl.toString()] = Date.now();
+                console.log("[API] Cached paginated data for URL:", decodeURIComponent(paginatedUrl.toString()));
+            } else {
+                console.error("[API] Failed to fetch paginated data for URL:", decodeURIComponent(paginatedUrl.toString()), paginatedResponse.status);
+                break;
+            }
+
+            nextOffset = paginatedData.offset;
+        }
+
+        mergePaginatedData(referrerHostname);
     }
 
     for (const key in cache[referrerHostname]) {
