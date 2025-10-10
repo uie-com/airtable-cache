@@ -151,7 +151,7 @@ async function loadCache(referrerHostname: string) {
 
     if (fs.existsSync(cacheFilePath)) {
         const fileContent = fs.readFileSync(cacheFilePath, 'utf8');
-        const jsonString = fileContent.replace(PREFIX, '').replace(SUFFIX, '');
+        const jsonString = fileContent.replace(PREFIX, '').replace(SUFFIX, '').trim();
         const loadedCache = JSON.parse(jsonString);
 
         cache[referrerHostname] = loadedCache;
