@@ -1,7 +1,7 @@
 import { NextRequest } from "next/server";
 
 const AIRTABLE_API_KEY = process.env.AIRTABLE_API_KEY;
-const REFRESH_INTERVAL = 15 * 60 * 1000; // 15 minutes
+const REFRESH_INTERVAL = 5 * 60 * 1000; // 5 minutes
 const FORGET_INTERVAL = 7 * 24 * 60 * 60 * 1000; // 7 days
 
 let cache: { [referrer: string]: { [url: string]: any } } = {};
@@ -120,7 +120,7 @@ async function mergePaginatedData(referrerHostname: string) {
         const end = offsetEnds.find(req => req?.offset === start.offset);
         if (!end) continue;
 
-        console.log("[API] Backfilling paginated data and deleting request:", end.url);
+        console.log("[API] Backfilling paginated data and deleting request:", end.url, "\n\n-- Merging ", start.data.records ? start.data.records.length : 'N/A', " <-- ", end.data.records ? end.data.records.length : 'N/A', " records.");
         if (start.data.records && end.data.records) {
             start.data.records = start.data.records.concat(end.data.records);
             start.data.offset = end.data.offset || undefined;
@@ -146,7 +146,7 @@ async function saveCache(referrerHostname: string) {
     const cacheFilePath = path.join(process.cwd(), 'public', 'cache-' + referrerHostname + '.js');
 
     fs.writeFileSync(cacheFilePath, cacheString, 'utf8');
-    console.log("[API] Cache saved to", cacheFilePath);
+    console.log("[API] Cache saved to", cacheFilePath, '\n\n');
 }
 
 async function loadCache(referrerHostname: string) {
@@ -166,7 +166,7 @@ async function loadCache(referrerHostname: string) {
             timestamps[referrerHostname][url] = Date.now();
         }
 
-        console.log("[API] Cache loaded from", cacheFilePath.toString());
+        console.log('[API] Cache loaded from cache-' + referrerHostname + '.js');
     } else {
         cache[referrerHostname] = {};
         timestamps[referrerHostname] = {};
@@ -178,7 +178,7 @@ async function refreshCache(url: string, referrerHostname: string) {
     const searchParams = new URL(url).searchParams;
 
     if (searchParams.has('offset')) {
-        console.log("[API] Skipping refresh for paginated request:", decodeURIComponent(url));
+        console.log("\n\n[API] Skipping refresh for paginated request:", decodeURIComponent(url));
         return;
     }
 
@@ -194,7 +194,7 @@ async function refreshCache(url: string, referrerHostname: string) {
     if (response.ok) {
         cache[referrerHostname][url] = data;
         timestamps[referrerHostname][url] = Date.now();
-        console.log("[API] Cache refreshed for URL:", decodeURIComponent(url));
+        console.log("\n\n[API] Cache refreshed for URL:", decodeURIComponent(url));
     }
 
     if (Object.keys(data).includes('offset')) {
@@ -232,7 +232,7 @@ async function refreshCache(url: string, referrerHostname: string) {
 
     for (const key in cache[referrerHostname]) {
         if (Date.now() - timestamps[referrerHostname][key] > FORGET_INTERVAL) {
-            console.log("[API] Forgetting cache for URL:", decodeURIComponent(key));
+            console.log("\n[API] Forgetting cache for unused URL:", decodeURIComponent(key));
             delete cache[key];
             delete timestamps[key];
         }
