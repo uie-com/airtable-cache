@@ -46,7 +46,7 @@ export async function GET(request: NextRequest) {
         loadCache(referrer);
     }
 
-    if (cache[referrer][url] && !(refresh === 'true')) {
+    if (cache[referrer]?.[url] && !(refresh === 'true')) {
         console.log("\n[API] Cache hit for URL:", decodeURIComponent(url));
         data = cache[referrer][url];
 
@@ -151,7 +151,7 @@ async function loadCache(referrerHostname: string) {
 
     if (fs.existsSync(cacheFilePath)) {
         const fileContent = fs.readFileSync(cacheFilePath, 'utf8') as string;
-        const jsonString = fileContent.substring(PREFIX.length, fileContent.lastIndexOf('}')).trim();
+        const jsonString = fileContent.substring(PREFIX.length, fileContent.lastIndexOf('}') + 1).trim();
         console.log("Trimmed JSON string:", jsonString); // Log the trimmed JSON string for debugging
         const loadedCache = JSON.parse(jsonString);
 
