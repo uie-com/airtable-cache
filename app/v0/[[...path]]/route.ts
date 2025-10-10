@@ -166,7 +166,7 @@ async function loadCache(referrerHostname: string) {
             timestamps[referrerHostname][url] = Date.now();
         }
 
-        console.log("[API] Cache loaded from", cacheFilePath);
+        console.log("[API] Cache loaded from", cacheFilePath.toString());
     } else {
         cache[referrerHostname] = {};
         timestamps[referrerHostname] = {};
