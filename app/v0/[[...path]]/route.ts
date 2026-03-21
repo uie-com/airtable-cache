@@ -1,8 +1,8 @@
 import { NextRequest } from "next/server";
 
 const AIRTABLE_API_KEY = process.env.AIRTABLE_API_KEY;
-const REFRESH_INTERVAL = 5 * 60 * 1000; // 5 minutes
-const FORGET_INTERVAL = 6.9 * 24 * 60 * 60 * 1000; // 7 days
+const REFRESH_INTERVAL = 15 * 60 * 1000; // 15 minutes
+const FORGET_INTERVAL = 0.9 * 24 * 60 * 60 * 1000; // 1 days
 
 let cache: { [referrer: string]: { [url: string]: any } } = {};
 let timestamps: { [referrer: string]: { [url: string]: number } } = {};
@@ -136,10 +136,10 @@ async function mergePaginatedData(referrerHostname: string) {
 }
 
 const PREFIX = 'export const cache = ';
-const SUFFIX = ';\nwindow.airtableCache = cache;';
+const SUFFIX = ';\nwindow.airtableCache = cache; /*';
 
 async function saveCache(referrerHostname: string) {
-    const cacheString = PREFIX + JSON.stringify(cache[referrerHostname]) + SUFFIX;
+    const cacheString = PREFIX + JSON.stringify(cache[referrerHostname]) + SUFFIX + JSON.stringify(timestamps[referrerHostname]);
 
     const fs = require('fs');
     const path = require('path');
@@ -156,7 +156,7 @@ async function loadCache(referrerHostname: string) {
 
     if (fs.existsSync(cacheFilePath)) {
         const fileContent = fs.readFileSync(cacheFilePath, 'utf8') as string;
-        const jsonString = fileContent.substring(PREFIX.length, fileContent.lastIndexOf('}') + 1).trim();
+        const jsonString = fileContent.substring(PREFIX.length, fileContent.indexOf(SUFFIX)).trim();
         const loadedCache = JSON.parse(jsonString);
 
         cache[referrerHostname] = loadedCache;
@@ -233,8 +233,8 @@ async function refreshCache(url: string, referrerHostname: string) {
     for (const key in cache[referrerHostname]) {
         if (Date.now() - timestamps[referrerHostname][key] > FORGET_INTERVAL) {
             console.log("\n[API] Forgetting cache for unused URL:", decodeURIComponent(key));
-            delete cache[key];
-            delete timestamps[key];
+            delete cache[referrerHostname][key];
+            delete timestamps[referrerHostname][key];
         }
     }
 
