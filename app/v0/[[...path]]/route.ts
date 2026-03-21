@@ -2,7 +2,7 @@ import { NextRequest } from "next/server";
 
 const AIRTABLE_API_KEY = process.env.AIRTABLE_API_KEY;
 const REFRESH_INTERVAL = 15 * 60 * 1000; // 15 minutes
-const FORGET_INTERVAL = 0.9 * 24 * 60 * 60 * 1000; // 1 days
+const FORGET_INTERVAL = 2.9 * 24 * 60 * 60 * 1000; // 3 days
 
 let cache: { [referrer: string]: { [url: string]: any } } = {};
 let timestamps: { [referrer: string]: { [url: string]: number } } = {};
