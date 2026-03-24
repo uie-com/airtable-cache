@@ -136,10 +136,10 @@ async function mergePaginatedData(referrerHostname: string) {
 }
 
 const PREFIX = 'export const cache = ';
-const SUFFIX = ';\nwindow.airtableCache = cache; /*';
+const SUFFIX = ';\nwindow.airtableCache = cache;';
 
 async function saveCache(referrerHostname: string) {
-    const cacheString = PREFIX + JSON.stringify(cache[referrerHostname]) + SUFFIX + JSON.stringify(timestamps[referrerHostname]);
+    const cacheString = PREFIX + JSON.stringify(cache[referrerHostname]) + SUFFIX;
 
     const fs = require('fs');
     const path = require('path');
@@ -160,10 +160,9 @@ async function loadCache(referrerHostname: string) {
         const loadedCache = JSON.parse(jsonString);
 
         cache[referrerHostname] = loadedCache;
-        timestamps[referrerHostname] = {};
 
-        for (const url in cache[referrerHostname]) {
-            timestamps[referrerHostname][url] = Date.now();
+        for (const key in loadedCache) {
+            timestamps[referrerHostname][key] = Date.now();
         }
 
         console.log('[API] Cache loaded from cache-' + referrerHostname + '.js');
