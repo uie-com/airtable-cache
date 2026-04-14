@@ -2,11 +2,15 @@
 // It keeps the newer JSON snapshot as the source of truth, rebuilds the
 // public preload file from that snapshot, and knows how to upgrade older cache
 // files into the current format without changing the service behavior.
-import fs from "node:fs/promises";
+import { promises as fileSystem } from "fs";
 import path from "node:path";
 
 import { assertJsonObject, HttpError } from "@/lib/airtable-cache/errors";
-import { normalizeAirtableUrl, siteKeyToFileToken } from "@/lib/airtable-cache/request";
+import {
+  normalizeAirtableUrl,
+  normalizeSiteKey,
+  siteKeyToFileToken,
+} from "@/lib/airtable-cache/request";
 import {
   AirtableConfig,
   CacheEntryState,
@@ -61,16 +65,16 @@ function buildPreloadScript(entries: Record<string, CacheEntryState>): string {
 // Write a file by first writing a temporary file and then renaming it into
 // place, so readers never see a half-written file.
 async function writeFileAtomically(filePath: string, contents: string): Promise<void> {
-  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  await fileSystem.mkdir(path.dirname(filePath), { recursive: true });
   const temporaryPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
-  await fs.writeFile(temporaryPath, contents, "utf8");
-  await fs.rename(temporaryPath, filePath);
+  await fileSystem.writeFile(temporaryPath, contents, "utf8");
+  await fileSystem.rename(temporaryPath, filePath);
 }
 
 // Read a file if it exists, or return null if the path is missing.
 async function readFileIfExists(filePath: string): Promise<string | null> {
   try {
-    return await fs.readFile(filePath, "utf8");
+    return await fileSystem.readFile(filePath, "utf8");
   } catch (error) {
     if (isNotFoundError(error)) {
       return null;
@@ -86,7 +90,7 @@ async function restoreFileContents(
   previousContents: string | null,
 ): Promise<void> {
   if (previousContents === null) {
-    await fs.rm(filePath, { force: true });
+    await fileSystem.rm(filePath, { force: true });
     return;
   }
 
@@ -261,7 +265,7 @@ export class FileSystemCachePersistence implements CachePersistence {
     const snapshotPath = this.getSnapshotPath(siteKey);
 
     try {
-      const fileContents = await fs.readFile(snapshotPath, "utf8");
+      const fileContents = await fileSystem.readFile(snapshotPath, "utf8");
       const parsed = JSON.parse(fileContents) as unknown;
       const snapshot = this.normalizeLoadedSnapshot(siteKey, parsed);
       await this.reconcileDerivedPreloadFile(siteKey, snapshot.entries);
@@ -293,6 +297,37 @@ export class FileSystemCachePersistence implements CachePersistence {
           cause: error instanceof Error ? error.message : "Unknown error",
         },
       );
+    }
+  }
+
+  // Rebuild every missing or stale public preload file from the canonical JSON snapshots.
+  // The live service now relies on the `/cache-<site>.js` rewrite route to heal one file on
+  // demand, but this bulk helper is still useful for maintenance scripts and focused tests.
+  async reconcileAllDerivedPreloadFiles(): Promise<void> {
+    const snapshotFilePaths = await this.findSnapshotPaths();
+
+    for (const snapshotFilePath of snapshotFilePaths) {
+      try {
+        const fileContents = await fileSystem.readFile(snapshotFilePath, "utf8");
+        const parsed = JSON.parse(fileContents) as unknown;
+        assertJsonObject(parsed, 500, "CACHE_PARSE_FAILED", "Cache snapshot must be an object.");
+
+        if (typeof parsed.siteKey !== "string") {
+          this.logger.warn("Skipping startup preload reconciliation for a snapshot without siteKey.", {
+            snapshotFilePath,
+          });
+          continue;
+        }
+
+        const siteKey = normalizeSiteKey(parsed.siteKey);
+        const snapshot = this.normalizeLoadedSnapshot(siteKey, parsed);
+        await this.reconcileDerivedPreloadFile(siteKey, snapshot.entries);
+      } catch (error) {
+        this.logger.error("Failed to reconcile a startup preload file from a snapshot.", {
+          snapshotFilePath,
+          cause: error instanceof Error ? error.message : "Unknown error",
+        });
+      }
     }
   }
 
@@ -455,7 +490,7 @@ export class FileSystemCachePersistence implements CachePersistence {
       migration.filesToDelete
         .filter((filePath) => filePath !== this.getPreloadPath(siteKey))
         .map(async (filePath) => {
-          await fs.rm(filePath, { force: true });
+          await fileSystem.rm(filePath, { force: true });
         }),
     );
 
@@ -503,7 +538,7 @@ export class FileSystemCachePersistence implements CachePersistence {
   // be merged into the new snapshot format.
   private async readLegacyCacheFile(filePath: string): Promise<Record<string, JsonObject>> {
     try {
-      const fileContents = await fs.readFile(filePath, "utf8");
+      const fileContents = await fileSystem.readFile(filePath, "utf8");
       const jsonString = extractLegacyPreloadJson(fileContents);
       const parsed = JSON.parse(jsonString) as unknown;
 
@@ -544,7 +579,7 @@ export class FileSystemCachePersistence implements CachePersistence {
   // Read one old timestamp file and keep only valid numeric values.
   private async readLegacyTimestampFile(filePath: string): Promise<Record<string, number>> {
     try {
-      const fileContents = await fs.readFile(filePath, "utf8");
+      const fileContents = await fileSystem.readFile(filePath, "utf8");
       const parsed = JSON.parse(fileContents) as unknown;
       assertJsonObject(
         parsed,
@@ -609,7 +644,7 @@ export class FileSystemCachePersistence implements CachePersistence {
 
     for (const candidatePath of candidatePaths) {
       try {
-        await fs.access(candidatePath);
+        await fileSystem.access(candidatePath);
         foundPaths.push(candidatePath);
       } catch {
         continue;
@@ -617,5 +652,24 @@ export class FileSystemCachePersistence implements CachePersistence {
     }
 
     return foundPaths;
+  }
+
+  // Return every canonical snapshot file currently stored on disk.
+  private async findSnapshotPaths(): Promise<string[]> {
+    try {
+      const directoryEntries = await fileSystem.readdir(this.config.cacheDataDir, {
+        withFileTypes: true,
+      });
+
+      return directoryEntries
+        .filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
+        .map((entry) => path.join(this.config.cacheDataDir, entry.name));
+    } catch (error) {
+      if (isNotFoundError(error)) {
+        return [];
+      }
+
+      throw error;
+    }
   }
 }

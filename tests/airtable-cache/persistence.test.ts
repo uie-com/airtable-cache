@@ -315,6 +315,55 @@ window.airtableCache = cache;
     );
   });
 
+  it("rebuilds missing preload files for every stored snapshot during startup reconciliation", async () => {
+    const workspace = createTempWorkspace();
+    workspaces.push(workspace.rootDir);
+
+    const siteKey = EXAMPLE_SITE_KEY;
+    const snapshotPath = path.join(
+      workspace.dataDir,
+      `${siteKeyToFileToken(siteKey)}.json`,
+    );
+    const preloadPath = path.join(
+      workspace.publicDir,
+      `cache-${siteKeyToFileToken(siteKey)}.js`,
+    );
+
+    fs.writeFileSync(
+      snapshotPath,
+      JSON.stringify(
+        {
+          version: 1,
+          siteKey,
+          savedAt: 1_700_000_000_000,
+          entries: {
+            [EXAMPLE_FILTERED_LABS_URL]: {
+              body: EXAMPLE_FILTERED_LABS_BODY,
+              updatedAt: 1_700_000_000_000,
+              lastAccessedAt: 1_700_000_000_000,
+            },
+          },
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+
+    const persistence = new FileSystemCachePersistence(
+      createTestConfig(workspace),
+      testLogger,
+      () => 1_700_000_000_500,
+    );
+
+    await persistence.reconcileAllDerivedPreloadFiles();
+
+    expect(fs.existsSync(preloadPath)).toBe(true);
+    expect(readPreloadCache(preloadPath)[EXAMPLE_FILTERED_LABS_URL]).toEqual(
+      EXAMPLE_FILTERED_LABS_BODY,
+    );
+  });
+
   it("normalizes persisted snapshots by dropping invalid entries and stripping offsets", async () => {
     const workspace = createTempWorkspace();
     workspaces.push(workspace.rootDir);

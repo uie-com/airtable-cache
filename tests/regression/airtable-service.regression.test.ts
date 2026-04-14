@@ -28,8 +28,11 @@ import {
 } from "@/tests/test-utils";
 
 const TEST_TIMEOUT_MS = 90_000;
-const STALE_AFTER_MS = 80;
-const EVICT_AFTER_MS = 250;
+// This regression boots a full Next.js server and touches the filesystem on every cache update.
+// The freshness windows need enough room that normal process jitter does not turn an intended
+// "fresh hit" assertion into a flaky "stale" response on slower machines or busy CI runners.
+const STALE_AFTER_MS = 250;
+const EVICT_AFTER_MS = 700;
 const REGRESSION_OFFSET_TOKEN = "itrRegressionPublished/recPageTwo";
 
 interface RegressionResponse {
