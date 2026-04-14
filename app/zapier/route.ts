@@ -1,34 +1,25 @@
-import { NextRequest, NextResponse } from 'next/server';
+// This route is the small HTTP entry point for the Zapier proxy.
+// Its job is to receive a request, hand it to the Zapier service, and turn the result back into a Next.js response.
+import { NextRequest, NextResponse } from "next/server";
 
+import { toErrorResponse } from "@/lib/airtable-cache/errors";
+import { getZapierProxyService } from "@/lib/zapier/service";
+
+// Next.js should run this route in Node.js because the Zapier service uses server-only features like global process env access.
+export const runtime = "nodejs";
+
+// Handle POST requests from Zapier.
+// The real work happens in the shared Zapier proxy service; this function only wraps success and failure into HTTP responses.
 export async function POST(request: NextRequest) {
-    try {
-        const { searchParams } = new URL(request.url);
-        const endpoint = searchParams.get('endpoint');
+  try {
+    const response = await getZapierProxyService().handle(request);
 
-        if (!endpoint) {
-            return NextResponse.json(
-                { error: 'Endpoint parameter is required' },
-                { status: 400 }
-            );
-        }
-
-        const body = await request.json();
-
-        const response = await fetch(endpoint, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-            },
-            body: JSON.stringify(body),
-        });
-
-        const data = await response.json();
-
-        return NextResponse.json(data, { status: response.status });
-    } catch (error) {
-        return NextResponse.json(
-            { error: 'Failed to forward request' },
-            { status: 500 }
-        );
-    }
+    return NextResponse.json(response.body, {
+      status: response.status,
+      headers: response.headers,
+    });
+  } catch (error) {
+    const response = toErrorResponse(error, "Failed to forward the Zapier request.");
+    return NextResponse.json(response.body, { status: response.status });
+  }
 }

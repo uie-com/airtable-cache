@@ -1,170 +1,167 @@
-# Airtable Cache
+# Airtable Cache Service
 
-The **Airtable Cache** is a tiny proxy layer in front of the Airtable REST API that dramatically reduces perceived load time for our React sites.  
-It does this by (1) caching GET responses per-site, (2) publishing that cache as a public JS file that ships with your site, and (3) checking that file synchronously during the very first render — so data is there **before** the UI paints.
+This project is a persistent Airtable proxy for Center Centre sites.
 
-## 🧭 Overview
+It does three jobs:
 
-- **Drop-in proxy**: React apps rewrite Airtable API requests to the cache service URL instead of the Airtable API.
-- **Warm, per-site memory**: First time a request is seen, the cache forwards to Airtable, stores the JSON, and returns it.  
-  Next time, it returns immediately and refreshes in the background if stale.
-- **Static preload**: For each site (identified by a slug/hostname), the cache writes a **public JS file** that exports the site’s request→response map and attaches it to `window.airtableCache`.  
-  Each React app loads this file at startup to get “instant” data.
+1. Proxies Airtable `GET` requests through `/v0/...`
+2. Caches merged Airtable datasets per site key in memory and on disk
+3. Publishes a generated preload file for each site so clients can hydrate synchronously
 
-Result: common views render with fresh data without any visible loading states.
+The service is designed for a long-running VM process, not a function runtime.
 
-## ✨ Key Behaviors
+## How It Works
 
-- **Cache TTL**: in-memory entries are considered stale after **5 minutes** and refresh in the background.  
-- **Garbage collection**: entries unused for **24 hours** are dropped.
-- **Per-site isolation**: cache is keyed by the site slug/hostname; sites do not share entries.
-- **Non-critical**: if the cache is unreachable, the async helpers fall back to Airtable directly — pages still work (just slower).
+Each Airtable request is scoped to a site key.
 
-## 🧑‍💻 Client Usage
+- Preferred: pass `?ref=<site-key>`
+- Fallback: omit `ref` and send a valid `Referer` header
 
-Use the shared helpers under `shared/data/airtable/` in your codebase. Each helper has **sync** and **async** flavors:
+The route handler normalizes the request into one Airtable URL and one cache key.
+`offset` is never part of the cache identity. A paginated Airtable query is always fetched and stored as one merged dataset.
 
-- **Sync (“cache”) helpers** — labeled with “cache”:  
-  - Meant for **initial render** (server or client)  
-  - Read from the preloaded JS file (`window.airtableCache`) synchronously  
-  - No network, instant return
+### Request lifecycle
 
-- **Async helpers** — e.g., `airtableFetch(url)`:  
-  - Check the preloaded file first  
-  - Then call the cache service  
-  - If that fails, **fallback to Airtable API** directly
+1. Parse the site key and Airtable path.
+2. Load the site's JSON snapshot from `data/cache/` if it is not already in memory.
+3. Return a hot cache hit immediately.
+4. If the cached entry is stale, return it immediately and refresh it in the background.
+5. On a cold miss or `refresh=true`, fetch every Airtable page, merge the records, persist the result, and return it.
 
-> These fallbacks make the cache an **important but non-critical** service.
+### Persistence model
 
-## ⚙️ Configuration (per-site slug)
+`data/cache/<site-token>.json` is the source of truth.
 
-Every site identifies itself with a unique **slug** so it can read/write the correct cache file.
+Each snapshot stores:
 
-- In local dev, the slug comes from the dev script (e.g., `npm run dev:my-site`) and populates an env like `VITE_APP`.
-- In production, ensure the same slug is set for **all** deployments of the same site so they share the same preload file.
+- `body`
+- `updatedAt`
+- `lastAccessedAt`
 
-## 📦 Preloading the Cache (static file)
+`public/cache-<site-token>.js` is generated from that snapshot and only contains the `url -> json` preload map used by clients.
 
-Once your site routes its Airtable calls through the helpers, the cache will start generating the per-site preload file automatically.
+Both files are written with temp-file rename semantics so partially written files are not served.
 
-Add this to your site’s `<head>` (replace `[SLUG]` with your slug or hostname):
+### Legacy migration
 
-```html
-<script type="module" src="https://airtable.centercentre.com/cache-[SLUG].centercentre.com.js"></script>
+Older deployments wrote cache state directly to `public/cache-*.js` plus optional `timestamps-*.json`.
+
+On first load, the service will:
+
+- read supported legacy files for the requested site
+- merge paginated fragments keyed by `offset`
+- write the new JSON snapshot and generated preload file
+- remove obsolete legacy files when the new files are in place
+
+Historical filename variants are supported, including names such as `cache-localhost:3000.js`.
+
+## Cache Policy
+
+Default policy:
+
+- stale after `15 minutes`
+- evict after `72 hours`
+
+Eviction uses `lastAccessedAt`, not only `updatedAt`.
+
+Environment overrides:
+
+- `CACHE_STALE_AFTER_MS`
+- `CACHE_EVICT_AFTER_MS`
+- `AIRTABLE_FETCH_TIMEOUT_MS`
+- `CACHE_DATA_DIR`
+- `CACHE_PUBLIC_DIR`
+- `AIRTABLE_API_BASE_URL` for local/regression testing only
+
+## API
+
+### Airtable proxy
+
+`GET /v0/<airtable-path>?<original-query>&ref=<site-key>&refresh=true|false`
+
+Notes:
+
+- `ref` must be a slug/hostname token, not a full URL
+- base requests always return one merged dataset for paginated Airtable tables
+- `refresh=true` bypasses the cached entry and fetches fresh Airtable data
+- response headers include `X-Airtable-Cache` with `hit`, `stale`, `miss`, or `refresh`
+
+### Zapier proxy
+
+`POST /zapier?endpoint=<url>`
+
+Required environment:
+
+- `ZAPIER_SHARED_SECRET`
+- `ZAPIER_ALLOWED_HOSTS` as a comma-separated allowlist
+
+Required request auth:
+
+- `x-zapier-secret: <secret>`
+- or `Authorization: Bearer <secret>`
+
+The endpoint host must be allowlisted. Arbitrary forwarding is intentionally blocked.
+
+## Environment
+
+Required:
+
+- `AIRTABLE_API_KEY`
+
+Optional:
+
+- `CACHE_DATA_DIR`
+- `CACHE_PUBLIC_DIR`
+- `CACHE_STALE_AFTER_MS`
+- `CACHE_EVICT_AFTER_MS`
+- `AIRTABLE_FETCH_TIMEOUT_MS`
+- `ZAPIER_SHARED_SECRET`
+- `ZAPIER_ALLOWED_HOSTS`
+
+## Development
+
+Install dependencies:
+
+```bash
+npm install
 ```
 
-- The server writes files named `public/cache-[referrerHostname].js` (derived from the `ref` query param or the request’s `Referer` host).
-- The file looks like:
+Run the service:
 
-  ```js
-  export const cache = { /* url → json */ };
-  window.airtableCache = cache;
-  ```
+```bash
+npm run dev
+```
 
-> If you’ve added a **new** slug, you may need to restart the service (per your deployment) so the file is publicly served.
+Run the full validation gate:
 
-## 🔌 API (Cache Service)
+```bash
+npm run check
+```
 
-The cache is a **Next.js** app with a single route that handles **all GETs** as if it were Airtable. It preserves path and query, with two additional parameters:
+Other useful commands:
 
-- `ref` — site slug/hostname (string). If missing, the cache tries to infer it from the HTTP `Referer` header’s hostname (falls back to `unknown`).
-- `refresh` — `"true"` or `"false"` (string). When `true`, bypasses the in-memory entry and fetches live from Airtable.
+```bash
+npm run lint
+npm run typecheck
+npm run test
+npm run build
+```
 
-### Request mapping
+## File Layout
 
-- Incoming request:  
-  `GET https://airtable.centercentre.com/app/**...**?<original_query>&ref=<slug>&refresh=<bool>`
-- The server rewrites to Airtable:  
-  `GET https://api.airtable.com/**...**?<original_query>` (removing `ref` and `refresh`)
+Important paths:
 
-### Response
+- `app/v0/[[...path]]/route.ts`: thin Airtable proxy route
+- `app/zapier/route.ts`: thin Zapier route
+- `lib/airtable-cache/`: request parsing, Airtable client, persistence, cache store, logging, config
+- `lib/zapier/service.ts`: hardened Zapier forwarding
+- `tests/`: request, persistence, route, and cache behavior coverage
 
-- Returns Airtable’s JSON payload and HTTP status.  
-- On **cache hit** and `refresh !== "true"`: responds immediately from memory (200) and may refresh in the background if stale.  
-- On **cache miss**: fetches from Airtable, stores the result (per `ref` + URL), saves/updates the preload file, returns the JSON.
+The route handlers should stay small. If you need to change cache behavior, change the service modules first and keep the routes as adapters.
 
-## 🗃️ Caching Rules (from code)
+## Operational Notes
 
-- **TTL** (`REFRESH_INTERVAL`): `5 * 60 * 1000` ms (5 minutes)  
-  > After TTL, a hit still returns **instantly**, but the server kicks off a background refresh.
-- **GC** (`FORGET_INTERVAL`): `24 * 60 * 60 * 1000` ms (24 hours)  
-  > Entries older than GC with no refresh are deleted during refresh passes.
-- **Per-site dictionary**:  
-  `cache[referrer][url] = json`  
-  `timestamps[referrer][url] = lastUpdatedMs`
-
-## 🔒 Security Notes
-
-- The Airtable API key is **server-side only** (never placed in the preload file).
-- Consider restricting who can call the cache:
-  - add an **Origin allowlist**,
-  - or require a **shared secret** header/query,
-  - or place the service behind your network edge.
-- The cache **only supports GET**; do not route mutations through it.
-
-## 🛠️ Environment
-
-Create `.env.local` in the project root:
-
-| Variable             | Purpose |
-|---|---|
-| `AIRTABLE_API_KEY` | Airtable API key used by the proxy to call `api.airtable.com`. |
-
-> Do **not** commit secrets. Use a secrets manager in production.
-
-## 🏗️ Hosting
-
-- Next.js app hosted on your infrastructure (e.g., a droplet/VM).  
-- Public base URL (examples above use `https://airtable.centercentre.com`).  
-- Ensure the process has write access to `public/` to emit **cache preload** files.  
-- Per your platform, a restart may be required for newly created preload files to be served publicly.
-
-## 🧪 Local Setup
-
-1. Clone & install  
-   ```bash
-   git clone https://github.com/uie-com/airtable-cache
-   cd airtable-cache
-   npm install
-   ```
-
-2. Configure env  
-   ```dotenv
-   AIRTABLE_API_KEY=YOUR_KEY
-   ```
-
-3. Run  
-   ```bash
-   npm run dev
-   # Then call it like you'd call Airtable (append ?ref=<slug>):
-   curl "http://localhost:4444/app/v0/appXXXXXXXX/tblYYYYYYYY?maxRecords=1&ref=my-site"
-   ```
-
-4. Add the preload script to your site  
-   ```html
-   <script type="module" src="http://localhost:4444/cache-my-site.js"></script>
-   ```
-
-## 🧩 Integration Tips
-
-- Route **all Airtable GETs** through the shared helpers in `shared/data/airtable`.
-- Keep a stable **slug** across environments for the same site so they share the same preload file.
-- When you add a brand-new slug/hostname, verify the cache file exists at:  
-  `/cache-<slug>.js` on the cache server.
-
-## 🧰 Troubleshooting
-
-- **I don’t see `window.airtableCache` on first paint**  
-  - Confirm the preload script tag URL (hostname/slug) is correct.  
-  - Ensure the cache service wrote `public/cache-<slug>.js` and it’s being served.  
-  - Restart the cache service if your platform needs it to serve new files.
-
-- **Data changes aren’t visible immediately**  
-  - TTL is 5 minutes. Force live data by adding `&refresh=true` to the request (async paths only).
-
-- **The cache is down**  
-  - Async helpers will fall back to Airtable API directly; pages will work with normal loading spinners.
-
-## 📄 License
-
-Released under the **MIT License**. See `LICENSE`.
+- Generated files under `data/cache/` and `public/cache-*.js` are runtime artifacts and should not be committed.
+- If a snapshot becomes corrupted, delete the affected `data/cache/<site-token>.json` and the next request will rebuild it from Airtable.
+- If an old deployment still has `public/cache-*.js` files only, the first request for that site will migrate them.
+- The service assumes one Node process per VM. It does not coordinate cache state across multiple workers or multiple machines.

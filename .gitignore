@@ -40,5 +40,9 @@ yarn-error.log*
 *.tsbuildinfo
 next-env.d.ts
 
+/data/cache/
 /public/cache.js
 /public/cache-*.js
+/public/timestamps-*.json
+/cache-*.js
+/new-cache-*.js
