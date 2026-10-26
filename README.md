@@ -120,6 +120,12 @@ Optional:
 
 ## Development
 
+Use Node.js 24 for development and validation. With nvm, select the project version with:
+
+```bash
+nvm use
+```
+
 Install dependencies:
 
 ```bash
