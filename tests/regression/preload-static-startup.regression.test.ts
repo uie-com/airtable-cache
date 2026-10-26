@@ -262,7 +262,7 @@ async function requestHeadersWithCurl(url: string): Promise<HeaderSnapshot> {
   };
 }
 
-describe.sequential("restart static preload regression", () => {
+describe("restart static preload regression", () => {
   let workspace: TestWorkspace;
   let app: RunningBuiltApp;
   let airtableStub: AirtableStub;

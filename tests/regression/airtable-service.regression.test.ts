@@ -348,7 +348,7 @@ async function requestJson(url: string): Promise<RegressionResponse> {
   };
 }
 
-describe.sequential("launched Airtable cache regression", () => {
+describe("launched Airtable cache regression", () => {
   let workspace: TestWorkspace;
   let app: RunningApp;
   let airtableStub: Awaited<ReturnType<typeof startAirtableStub>>;

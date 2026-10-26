@@ -2,6 +2,9 @@
   "name": "airtable",
   "version": "0.1.0",
   "private": true,
+  "engines": {
+    "node": ">=24 <25"
+  },
   "scripts": {
     "prepare:preloads": "node scripts/prepare-preloads.mjs",
     "dev": "node scripts/run-next-with-preloads.mjs dev",
@@ -15,21 +18,21 @@
     "check": "npm run lint && npm run typecheck && npm run test && npm run test:regression"
   },
   "dependencies": {
-    "next": "^15.5.7",
+    "next": "^16.4.3",
     "react": "19.1.0",
     "react-dom": "19.1.0"
   },
   "devDependencies": {
     "@eslint/eslintrc": "^3.3.1",
     "@tailwindcss/postcss": "^4",
-    "@types/node": "^20",
+    "@types/node": "^24",
     "@types/react": "^19",
     "@types/react-dom": "^19",
-    "@vitest/coverage-v8": "^3.2.4",
+    "@vitest/coverage-v8": "^5.0.5",
     "eslint": "^9.38.0",
     "eslint-config-next": "^15.5.7",
     "tailwindcss": "^4",
     "typescript": "^5",
-    "vitest": "^3.2.4"
+    "vitest": "^5.0.5"
   }
 }
