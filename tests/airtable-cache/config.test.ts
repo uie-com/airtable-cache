@@ -7,61 +7,64 @@ import {
   DEFAULT_EVICT_AFTER_MS,
   DEFAULT_FETCH_TIMEOUT_MS,
   DEFAULT_STALE_AFTER_MS,
+  MAX_FETCH_TIMEOUT_MS,
 } from "@/lib/airtable-cache/config";
 import { HttpError } from "@/lib/airtable-cache/errors";
 
 describe("airtable cache config", () => {
-  it("creates a config with defaults when only the Airtable key is present", () => {
-    const config = createAirtableConfig(
-      {
-        AIRTABLE_API_KEY: " test-key ",
-      } as unknown as NodeJS.ProcessEnv,
-      "/srv/airtable",
-    );
-
+  it("uses a non-public preload directory by default", () => {
+    const config = createAirtableConfig({ AIRTABLE_API_KEY: " test-key " } as unknown as NodeJS.ProcessEnv, "/srv/app");
     expect(config).toEqual({
       apiKey: "test-key",
-      cacheDataDir: path.join("/srv/airtable", "data", "cache"),
-      publicCacheDir: path.join("/srv/airtable", "public"),
+      cacheDataDir: path.join("/srv/app", "data", "cache"),
+      preloadCacheDir: path.join("/srv/app", "data", "preloads"),
       staleAfterMs: DEFAULT_STALE_AFTER_MS,
       evictAfterMs: DEFAULT_EVICT_AFTER_MS,
       fetchTimeoutMs: DEFAULT_FETCH_TIMEOUT_MS,
     });
   });
 
-  it("resolves directory and duration overrides", () => {
+  it("accepts custom non-public directories and rejects public descendants", () => {
     const config = createAirtableConfig(
-      {
-        AIRTABLE_API_KEY: "key",
-        CACHE_DATA_DIR: "../shared/cache",
-        CACHE_PUBLIC_DIR: "/var/www/cache-public",
-        CACHE_STALE_AFTER_MS: "1234",
-        CACHE_EVICT_AFTER_MS: "5678",
-        AIRTABLE_FETCH_TIMEOUT_MS: "9012",
-      } as unknown as NodeJS.ProcessEnv,
-      "/srv/airtable/app",
+      { AIRTABLE_API_KEY: "key", CACHE_PRELOAD_DIR: "../preloads" } as unknown as NodeJS.ProcessEnv,
+      "/srv/app",
     );
-
-    expect(config.cacheDataDir).toBe(path.resolve("/srv/airtable/app", "../shared/cache"));
-    expect(config.publicCacheDir).toBe("/var/www/cache-public");
-    expect(config.staleAfterMs).toBe(1234);
-    expect(config.evictAfterMs).toBe(5678);
-    expect(config.fetchTimeoutMs).toBe(9012);
+    expect(config.preloadCacheDir).toBe("/srv/preloads");
+    expect(() => createAirtableConfig(
+      { AIRTABLE_API_KEY: "key", CACHE_PRELOAD_DIR: "public/generated" } as unknown as NodeJS.ProcessEnv,
+      "/srv/app",
+    )).toThrow(HttpError);
   });
 
-  it("rejects missing Airtable keys and invalid duration overrides", () => {
-    expect(() => createAirtableConfig({} as unknown as NodeJS.ProcessEnv, "/srv")).toThrow(
-      HttpError,
-    );
+  it("rejects missing keys and invalid durations", () => {
+    expect(() => createAirtableConfig({} as unknown as NodeJS.ProcessEnv, "/srv")).toThrow(HttpError);
+    expect(() => createAirtableConfig(
+      { AIRTABLE_API_KEY: "key", CACHE_STALE_AFTER_MS: "0" } as unknown as NodeJS.ProcessEnv,
+      "/srv",
+    )).toThrow(/CACHE_STALE_AFTER_MS must be a positive safe integer/i);
+  });
 
-    expect(() =>
-      createAirtableConfig(
-        {
-          AIRTABLE_API_KEY: "key",
-          CACHE_STALE_AFTER_MS: "0",
-        } as unknown as NodeJS.ProcessEnv,
+  it("requires integer-safe durations and a platform-safe fetch timeout", () => {
+    for (const [envKey, value] of [
+      ["CACHE_EVICT_AFTER_MS", "1.5"],
+      ["CACHE_STALE_AFTER_MS", String(Number.MAX_SAFE_INTEGER + 1)],
+      ["AIRTABLE_FETCH_TIMEOUT_MS", "1.5"],
+      ["AIRTABLE_FETCH_TIMEOUT_MS", String(MAX_FETCH_TIMEOUT_MS + 1)],
+    ]) {
+      expect(() => createAirtableConfig(
+        { AIRTABLE_API_KEY: "key", [envKey]: value } as unknown as NodeJS.ProcessEnv,
         "/srv",
-      ),
-    ).toThrow(/CACHE_STALE_AFTER_MS must be a positive number/i);
+      )).toThrow(HttpError);
+    }
+
+    expect(() => createAirtableConfig(
+      { AIRTABLE_API_KEY: "key", AIRTABLE_FETCH_TIMEOUT_MS: String(MAX_FETCH_TIMEOUT_MS + 1) } as unknown as NodeJS.ProcessEnv,
+      "/srv",
+    )).toThrow(`no greater than ${MAX_FETCH_TIMEOUT_MS}`);
+
+    expect(createAirtableConfig(
+      { AIRTABLE_API_KEY: "key", AIRTABLE_FETCH_TIMEOUT_MS: String(MAX_FETCH_TIMEOUT_MS) } as unknown as NodeJS.ProcessEnv,
+      "/srv",
+    ).fetchTimeoutMs).toBe(MAX_FETCH_TIMEOUT_MS);
   });
 });

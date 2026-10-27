@@ -23,28 +23,28 @@ describe("airtable cache logging", () => {
   it("logs warnings and errors with the expected scope prefix", () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
-    const logger = createLogger("zapier-proxy");
+    const logger = createLogger("airtable-cache");
 
-    logger.warn("Missing allowlist.", { source: "env" });
+    logger.warn("Missing cache metadata.", { source: "env" });
     logger.error("Request failed.");
 
-    expect(warnSpy).toHaveBeenCalledWith("[zapier-proxy] Missing allowlist.", {
+    expect(warnSpy).toHaveBeenCalledWith("[airtable-cache] Missing cache metadata.", {
       source: "env",
     });
-    expect(errorSpy).toHaveBeenCalledWith("[zapier-proxy] Request failed.");
+    expect(errorSpy).toHaveBeenCalledWith("[airtable-cache] Request failed.");
   });
 
   it("logs warning and error context only when context keys exist", () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
-    const logger = createLogger("zapier-proxy");
+    const logger = createLogger("airtable-cache");
 
     logger.warn("Missing cache metadata.");
-    logger.error("Request failed.", { endpointHost: "hooks.zapier.com" });
+    logger.error("Request failed.", { endpointHost: "api.airtable.com" });
 
-    expect(warnSpy).toHaveBeenCalledWith("[zapier-proxy] Missing cache metadata.");
-    expect(errorSpy).toHaveBeenCalledWith("[zapier-proxy] Request failed.", {
-      endpointHost: "hooks.zapier.com",
+    expect(warnSpy).toHaveBeenCalledWith("[airtable-cache] Missing cache metadata.");
+    expect(errorSpy).toHaveBeenCalledWith("[airtable-cache] Request failed.", {
+      endpointHost: "api.airtable.com",
     });
   });
 });

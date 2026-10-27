@@ -23,7 +23,7 @@ import {
   writeSnapshot,
 } from "@/tests/test-utils";
 
-describe("airtable cache service integration", () => {
+describe("airtable cache service", () => {
   const workspaces: string[] = [];
 
   afterEach(() => {
@@ -69,7 +69,7 @@ describe("airtable cache service integration", () => {
       `${siteKeyToFileToken(siteKey)}.json`,
     );
     const preloadPath = path.join(
-      workspace.publicDir,
+      workspace.preloadDir ?? path.join(workspace.rootDir, "preloads"),
       `cache-${siteKeyToFileToken(siteKey)}.js`,
     );
     const snapshot = JSON.parse(fs.readFileSync(snapshotPath, "utf8")) as {

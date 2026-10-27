@@ -1,38 +1,36 @@
-// This file turns environment variables into the one configuration object the cache service uses.
-// The goal is to keep the rest of the service from reading `process.env` directly so the behavior
-// stays centralized, testable, and easier for a new teammate to understand.
 import path from "node:path";
+import { realpathSync } from "node:fs";
 
 import { HttpError } from "@/lib/airtable-cache/errors";
-import { AirtableConfig } from "@/lib/airtable-cache/types";
+import { AirtableConfig, CacheConfig } from "@/lib/airtable-cache/types";
 
-// This is the default age, in milliseconds, after which a cache entry is considered stale.
-// Stale entries can still be served, but the service will try to refresh them in the background.
 export const DEFAULT_STALE_AFTER_MS = 15 * 60 * 1000;
-// This is the default lifetime, in milliseconds, after which a cache entry should be removed.
-// Once an entry is this old, the service treats it as expired instead of trying to reuse it.
 export const DEFAULT_EVICT_AFTER_MS = 72 * 60 * 60 * 1000;
-// This is the default timeout, in milliseconds, for outbound Airtable fetches.
-// It prevents a slow upstream request from tying up the service forever.
 export const DEFAULT_FETCH_TIMEOUT_MS = 15 * 1000;
+export const MAX_FETCH_TIMEOUT_MS = 2_147_483_647;
+export const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
+export const MAX_SNAPSHOT_BYTES = 4 * 1024 * 1024;
+export const MAX_PERSISTED_SITES = 256;
+export const MAX_ACTIVE_REQUESTS = 128;
 
-// Read a duration from an environment variable and make sure it is a real positive number.
-// If the variable is missing, the caller's fallback value is used instead.
 function parseDurationMs(
   rawValue: string | undefined,
   envKey: string,
   fallbackValue: number,
+  maximumValue = Number.MAX_SAFE_INTEGER,
 ): number {
   if (!rawValue) {
     return fallbackValue;
   }
 
   const parsedValue = Number(rawValue);
-  if (!Number.isFinite(parsedValue) || parsedValue <= 0) {
+  if (!Number.isSafeInteger(parsedValue) || parsedValue <= 0 || parsedValue > maximumValue) {
     throw new HttpError(
       500,
       "INVALID_CONFIGURATION",
-      `${envKey} must be a positive number of milliseconds.`,
+      `${envKey} must be a positive safe integer number of milliseconds${
+        maximumValue === Number.MAX_SAFE_INTEGER ? "" : ` no greater than ${maximumValue}`
+      }.`,
       { envKey, providedValue: rawValue },
     );
   }
@@ -40,9 +38,6 @@ function parseDurationMs(
   return parsedValue;
 }
 
-// Convert a path from configuration into an absolute directory path.
-// If the environment variable is missing, the code falls back to a known directory relative to the
-// current working directory so the service has a stable default on disk.
 function resolveDirectory(
   cwd: string,
   rawValue: string | undefined,
@@ -55,9 +50,23 @@ function resolveDirectory(
   return path.resolve(cwd, rawValue);
 }
 
-// Build the complete Airtable cache configuration from environment variables.
-// This is the only place that enforces required settings and default values, which keeps the rest of
-// the code from repeating the same checks in multiple places.
+function isInsideDirectory(candidatePath: string, directoryPath: string): boolean {
+  const relativePath = path.relative(directoryPath, candidatePath);
+  return relativePath === "" || (!relativePath.startsWith(`..${path.sep}`) && relativePath !== "..");
+}
+
+function physicalPath(filePath: string): string {
+  try {
+    return realpathSync(filePath);
+  } catch (error) {
+    if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+    const parent = path.dirname(filePath);
+    if (parent === filePath) throw error;
+    // These are deployment-time writable paths, not files to bundle into the build.
+    return path.join(/* turbopackIgnore: true */ physicalPath(parent), path.basename(filePath));
+  }
+}
+
 export function createAirtableConfig(
   env: NodeJS.ProcessEnv = process.env,
   cwd = process.cwd(),
@@ -72,9 +81,32 @@ export function createAirtableConfig(
   }
 
   return {
+    ...createCacheConfig(env, cwd),
     apiKey,
-    cacheDataDir: resolveDirectory(cwd, env.CACHE_DATA_DIR, path.join("data", "cache")),
-    publicCacheDir: resolveDirectory(cwd, env.CACHE_PUBLIC_DIR, "public"),
+    fetchTimeoutMs: parseDurationMs(env.AIRTABLE_FETCH_TIMEOUT_MS, "AIRTABLE_FETCH_TIMEOUT_MS", DEFAULT_FETCH_TIMEOUT_MS, MAX_FETCH_TIMEOUT_MS),
+  };
+}
+
+export function createCacheConfig(env: NodeJS.ProcessEnv = process.env, cwd = process.cwd()): CacheConfig {
+  const preloadCacheDir = physicalPath(resolveDirectory(
+    cwd,
+    env.CACHE_PRELOAD_DIR,
+    path.join("data", "preloads"),
+  ));
+  const publicDirectory = physicalPath(path.join(cwd, "public"));
+
+  if (isInsideDirectory(preloadCacheDir, publicDirectory)) {
+    throw new HttpError(
+      500,
+      "INVALID_CONFIGURATION",
+      "CACHE_PRELOAD_DIR must be outside the project public directory.",
+      { envKey: "CACHE_PRELOAD_DIR", providedValue: preloadCacheDir },
+    );
+  }
+
+  return {
+    cacheDataDir: physicalPath(resolveDirectory(cwd, env.CACHE_DATA_DIR, path.join("data", "cache"))),
+    preloadCacheDir,
     staleAfterMs: parseDurationMs(
       env.CACHE_STALE_AFTER_MS,
       "CACHE_STALE_AFTER_MS",
@@ -84,11 +116,6 @@ export function createAirtableConfig(
       env.CACHE_EVICT_AFTER_MS,
       "CACHE_EVICT_AFTER_MS",
       DEFAULT_EVICT_AFTER_MS,
-    ),
-    fetchTimeoutMs: parseDurationMs(
-      env.AIRTABLE_FETCH_TIMEOUT_MS,
-      "AIRTABLE_FETCH_TIMEOUT_MS",
-      DEFAULT_FETCH_TIMEOUT_MS,
     ),
   };
 }

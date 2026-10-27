@@ -18,19 +18,20 @@ describe("airtable cache service factory", () => {
   const originalEnv = {
     AIRTABLE_API_KEY: process.env.AIRTABLE_API_KEY,
     CACHE_DATA_DIR: process.env.CACHE_DATA_DIR,
-    CACHE_PUBLIC_DIR: process.env.CACHE_PUBLIC_DIR,
+    CACHE_PRELOAD_DIR: process.env.CACHE_PRELOAD_DIR,
   };
 
   afterEach(() => {
     resetAirtableCacheServiceForTests();
     process.env.AIRTABLE_API_KEY = originalEnv.AIRTABLE_API_KEY;
     process.env.CACHE_DATA_DIR = originalEnv.CACHE_DATA_DIR;
-    process.env.CACHE_PUBLIC_DIR = originalEnv.CACHE_PUBLIC_DIR;
+    process.env.CACHE_PRELOAD_DIR = originalEnv.CACHE_PRELOAD_DIR;
 
     for (const rootDir of workspaces.splice(0)) {
       cleanupTempWorkspace({
         rootDir,
         publicDir: `${rootDir}/public`,
+        preloadDir: `${rootDir}/preloads`,
         dataDir: `${rootDir}/data/cache`,
       });
     }
@@ -58,7 +59,7 @@ describe("airtable cache service factory", () => {
 
     process.env.AIRTABLE_API_KEY = "test-airtable-key";
     process.env.CACHE_DATA_DIR = workspace.dataDir;
-    process.env.CACHE_PUBLIC_DIR = workspace.publicDir;
+    process.env.CACHE_PRELOAD_DIR = workspace.preloadDir;
 
     const first = getAirtableCacheService();
     const second = getAirtableCacheService();

@@ -1,4 +1,5 @@
 import { HttpError } from "@/lib/airtable-cache/errors";
+import { MAX_ACTIVE_REQUESTS, MAX_SNAPSHOT_BYTES } from "@/lib/airtable-cache/config";
 import {
   AirtableClientContract,
   AirtableConfig,
@@ -9,31 +10,33 @@ import {
   ProxyResponse,
 } from "@/lib/airtable-cache/types";
 
-// This file owns the in-memory cache for one running Node process.
-// It decides when to read from memory, when to refresh from Airtable, when to write to disk,
-// and how to keep different requests for the same site from stepping on each other.
+const MAX_RESIDENT_SITES = 64;
+const MAX_ENTRIES_PER_SITE = 1_000;
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+
 interface SiteCacheState {
-  // `loaded` tells us whether we have already read the on-disk snapshot into memory.
   loaded: boolean;
-  // `entries` holds the current cached results for one site, keyed by the normalized request.
+  /**
+   * The entries in this map are the last successfully persisted snapshot.
+   * Requests never mutate this map while a snapshot is being written.  This
+   * makes a failed write unable to leave a new body in resident memory.
+   */
   entries: Record<string, CacheEntryState>;
-  // `refreshingCacheKeys` tracks which cache keys already have a background refresh running.
   refreshingCacheKeys: Set<string>;
-  // `hasQueuedPersist` prevents us from starting many metadata-only disk writes at once.
   hasQueuedPersist: boolean;
+  metadataPersistDirty: boolean;
+  pendingAccessedAt: Record<string, number>;
+  activeRequestCount: number;
+  lastUsedAt: number;
+  residentEvictionTimer?: ReturnType<typeof setTimeout>;
 }
 
-// This class is the main cache controller for the service.
-// It keeps the cache fast for reads, safe for writes, and predictable when multiple requests
-// arrive for the same site at nearly the same time.
 export class AirtableCacheStore {
-  // One map stores the full cache state for each site key.
   private readonly siteStateByKey = new Map<string, SiteCacheState>();
-  // Another map stores the per-site promise chain used as a simple lock.
   private readonly siteQueueByKey = new Map<string, Promise<void>>();
+  private readonly residentAdmissionWaiters = new Set<() => void>();
+  private activeRequests = 0;
 
-  // The store needs the cache policy, the disk persistence layer, the Airtable client,
-  // a logger, and a clock source so tests can control time.
   constructor(
     private readonly config: AirtableConfig,
     private readonly persistence: CachePersistence,
@@ -42,66 +45,58 @@ export class AirtableCacheStore {
     private readonly now: () => number = Date.now,
   ) {}
 
-  // This is the main entry point for one proxy request.
-  // It tries memory first, refreshes stale data in the background when possible,
-  // and falls back to a locked fetch path when it needs to rebuild the cache.
   async resolve(request: ProxyRequest): Promise<ProxyResponse> {
-    // Make sure the site snapshot has been loaded before we inspect or mutate it.
-    await this.ensureSiteLoaded(request.siteKey);
+    if (this.activeRequests >= MAX_ACTIVE_REQUESTS) {
+      throw new HttpError(503, "CACHE_BUSY", "The cache is busy. Retry shortly.");
+    }
+    this.activeRequests++;
+    try {
+      return await this.resolveAdmitted(request);
+    } finally {
+      this.activeRequests--;
+    }
+  }
 
-    const siteState = this.getOrCreateSiteState(request.siteKey);
-    const cachedEntry = siteState.entries[request.cacheKey];
-    const requestTime = this.now();
+  private async resolveAdmitted(request: ProxyRequest): Promise<ProxyResponse> {
+    const residentState = await this.acquireSiteState(request.siteKey);
+    let resolveFailed = false;
 
-    // A warm cache hit should return quickly without waiting for disk or Airtable.
-    if (cachedEntry && !request.forceRefresh) {
-      cachedEntry.lastAccessedAt = requestTime;
-      // Touch metadata should not slow down hot reads, so the disk write is queued.
-      this.scheduleMetadataPersist(request.siteKey);
+    try {
+      await this.ensureSiteLoaded(request.siteKey);
 
-      // If the entry is old enough to be stale, serve the last good value now and refresh later.
-      if (this.isEntryStale(cachedEntry, requestTime)) {
-        // Stale cache hits return immediately and refresh in the background under the site lock.
-        this.scheduleBackgroundRefresh(
-          request.siteKey,
-          request.cacheKey,
-          request.airtableUrl,
-        );
+      const siteState = this.getOrCreateSiteState(request.siteKey);
+      const requestTime = this.now();
+      const cachedEntry = this.getEffectiveEntry(siteState, request.cacheKey);
+
+      // Eviction is checked before recording this request as an access.  A
+      // dormant entry therefore cannot be revived by the request that finds it.
+      if (
+        cachedEntry &&
+        !request.forceRefresh &&
+        !this.isEntryExpired(cachedEntry, requestTime)
+      ) {
+        this.recordAccess(siteState, request.siteKey, request.cacheKey, requestTime);
+
+        if (this.isEntryStale(cachedEntry, requestTime)) {
+          this.scheduleBackgroundRefresh(
+            request.siteKey,
+            request.cacheKey,
+            request.airtableUrl,
+          );
+
+          return {
+            status: 200,
+            body: structuredClone(cachedEntry.body),
+            headers: {
+              "Cache-Control": "no-store",
+              "X-Airtable-Cache": "stale",
+            },
+          };
+        }
 
         return {
           status: 200,
           body: structuredClone(cachedEntry.body),
-          headers: {
-            "Cache-Control": "no-store",
-            "X-Airtable-Cache": "stale",
-          },
-        };
-      }
-
-      return {
-        status: 200,
-        body: structuredClone(cachedEntry.body),
-        headers: {
-          "Cache-Control": "no-store",
-          "X-Airtable-Cache": "hit",
-        },
-      };
-    }
-
-    // Cold misses, forced refreshes, and re-checking stale entries are serialized per site so
-    // only one request mutates the in-memory snapshot and on-disk files at a time.
-    return this.runWithSiteLock(request.siteKey, async () => {
-      const lockedSiteState = await this.loadSiteSnapshotIfNeeded(request.siteKey);
-      const lockedEntry = lockedSiteState.entries[request.cacheKey];
-      const lockedTime = this.now();
-
-      if (lockedEntry && !request.forceRefresh && !this.isEntryStale(lockedEntry, lockedTime)) {
-        lockedEntry.lastAccessedAt = lockedTime;
-        await this.persistSiteSnapshot(request.siteKey, lockedSiteState, lockedTime);
-
-        return {
-          status: 200,
-          body: structuredClone(lockedEntry.body),
           headers: {
             "Cache-Control": "no-store",
             "X-Airtable-Cache": "hit",
@@ -109,45 +104,107 @@ export class AirtableCacheStore {
         };
       }
 
-      const freshResponse = await this.client.fetchMergedResponse(request.airtableUrl);
+      return await this.runWithSiteLock(request.siteKey, async () => {
+        const lockedSiteState = await this.loadSiteSnapshotIfNeeded(request.siteKey);
+        const lockedTime = this.now();
+        const lockedEntries = this.buildWorkingEntries(lockedSiteState);
+        this.removeExpiredEntries(lockedEntries, lockedTime);
+        this.trimEntriesToCap(lockedEntries);
+        const lockedEntry = lockedEntries[request.cacheKey];
 
-      lockedSiteState.entries[request.cacheKey] = {
-        body: freshResponse.body,
-        updatedAt: lockedTime,
-        lastAccessedAt: lockedTime,
-      };
+        if (
+          lockedEntry &&
+          !request.forceRefresh &&
+          !this.isEntryStale(lockedEntry, lockedTime)
+        ) {
+          lockedEntry.lastAccessedAt = Math.max(lockedEntry.lastAccessedAt, lockedTime);
+          await this.saveCandidateAndCommit(
+            request.siteKey,
+            lockedSiteState,
+            lockedEntries,
+            lockedTime,
+          );
 
-      this.removeExpiredEntries(lockedSiteState, lockedTime);
-      await this.persistSiteSnapshot(request.siteKey, lockedSiteState, lockedTime);
+          return {
+            status: 200,
+            body: structuredClone(lockedEntry.body),
+            headers: {
+              "Cache-Control": "no-store",
+              "X-Airtable-Cache": "hit",
+            },
+          };
+        }
 
-      return {
-        status: freshResponse.status,
-        body: structuredClone(freshResponse.body),
-        headers: {
-          "Cache-Control": "no-store",
-          "X-Airtable-Cache": request.forceRefresh ? "refresh" : "miss",
-        },
-      };
-    });
+        // Do not timestamp a response before the upstream request completes.
+        // In particular, a slow fetch must not make its data appear older than
+        // it really is when it first enters the cache.
+        const freshResponse = await this.client.fetchMergedResponse(request.airtableUrl);
+        const completedAt = this.now();
+        this.touchSiteState(lockedSiteState, completedAt);
+        const candidateEntries = this.buildWorkingEntries(lockedSiteState);
+        this.removeExpiredEntries(candidateEntries, completedAt);
+        this.trimEntriesToCap(candidateEntries, request.cacheKey);
+        const previousLastAccessedAt = lockedEntry?.lastAccessedAt;
+        const existingLastAccessedAt = candidateEntries[request.cacheKey]?.lastAccessedAt;
+        const latestAccessedAt = Math.max(
+          completedAt,
+          previousLastAccessedAt ?? Number.NEGATIVE_INFINITY,
+          existingLastAccessedAt ?? Number.NEGATIVE_INFINITY,
+        );
+
+        candidateEntries[request.cacheKey] = {
+          body: structuredClone(freshResponse.body),
+          updatedAt: completedAt,
+          lastAccessedAt: latestAccessedAt,
+        };
+
+        await this.saveCandidateAndCommit(
+          request.siteKey,
+          lockedSiteState,
+          candidateEntries,
+          completedAt,
+          request.cacheKey,
+        );
+
+        return {
+          status: freshResponse.status,
+          body: structuredClone(freshResponse.body),
+          headers: {
+            "Cache-Control": "no-store",
+            "X-Airtable-Cache": request.forceRefresh ? "refresh" : "miss",
+          },
+        };
+      });
+    } catch (error) {
+      resolveFailed = true;
+      throw error;
+    } finally {
+      this.releaseSiteState(request.siteKey, residentState, resolveFailed);
+    }
   }
 
-  // Tests and shutdown code can wait for all queued work to finish for one site,
-  // or for every site the process currently knows about.
   async waitForIdle(siteKey?: string): Promise<void> {
     if (siteKey) {
       await this.waitForSiteQueueToDrain(siteKey);
+      this.scheduleResidentEviction(siteKey);
       return;
     }
 
     await Promise.all(
       Array.from(this.siteQueueByKey.keys()).map((key) => this.waitForSiteQueueToDrain(key)),
     );
+
+    // A caller often uses waitForIdle after advancing a test clock.  Running
+    // the lifecycle check here also makes dormant states release promptly,
+    // without requiring that a timer happen to fire at that instant.
+    for (const siteKeyToCheck of this.siteStateByKey.keys()) {
+      this.scheduleResidentEviction(siteKeyToCheck);
+    }
   }
 
-  // Loads the snapshot for one site the first time we need it.
-  // If the site is already in memory, this returns immediately.
   private async ensureSiteLoaded(siteKey: string): Promise<void> {
     const siteState = this.getOrCreateSiteState(siteKey);
+    this.touchSiteState(siteState);
     if (siteState.loaded) {
       return;
     }
@@ -157,23 +214,40 @@ export class AirtableCacheStore {
     });
   }
 
-  // Reads the on-disk snapshot once and keeps the result in memory.
-  // This is also where expired entries are trimmed after startup or migration.
   private async loadSiteSnapshotIfNeeded(siteKey: string): Promise<SiteCacheState> {
     const siteState = this.getOrCreateSiteState(siteKey);
     if (siteState.loaded) {
       return siteState;
     }
 
-    // The JSON snapshot is the source of truth. Legacy preload files are migrated on first load.
     const snapshot = await this.persistence.loadSiteSnapshot(siteKey);
-    siteState.entries = snapshot?.entries ?? {};
-    siteState.loaded = true;
+    const cleanedEntries = this.cloneEntries(snapshot?.entries ?? {});
+    const loadedAt = this.now();
+    const removedExpiredEntries = this.removeExpiredEntries(cleanedEntries, loadedAt);
+    const removedOverflowEntries = this.trimEntriesToCap(cleanedEntries);
 
-    const removedEntries = this.removeExpiredEntries(siteState, this.now());
-    if (removedEntries > 0) {
-      await this.persistSiteSnapshot(siteKey, siteState, this.now());
+    // Expired and over-cap entries are removed from a staged map.  A cleanup
+    // write must succeed before the staged map becomes resident; otherwise
+    // unload the state and rethrow so memory never diverges from disk.
+    if (removedExpiredEntries > 0 || removedOverflowEntries > 0) {
+      try {
+        await this.persistSiteSnapshot(siteKey, cleanedEntries, loadedAt);
+        siteState.entries = cleanedEntries;
+      } catch (error) {
+        this.logger.error("Failed to persist expired cache entries.", {
+          siteKey,
+          cause: error instanceof Error ? error.message : "Unknown error",
+        });
+        siteState.entries = {};
+        siteState.loaded = false;
+        throw error;
+      }
+    } else {
+      siteState.entries = cleanedEntries;
     }
+
+    siteState.loaded = true;
+    this.touchSiteState(siteState);
 
     this.logger.info("Loaded site cache into memory.", {
       siteKey,
@@ -183,69 +257,346 @@ export class AirtableCacheStore {
     return siteState;
   }
 
-  // Returns the existing in-memory state for a site, or creates a fresh empty one.
   private getOrCreateSiteState(siteKey: string): SiteCacheState {
     const existingState = this.siteStateByKey.get(siteKey);
     if (existingState) {
       return existingState;
     }
 
+    this.trimResidentStates();
+
     const newState: SiteCacheState = {
       loaded: false,
       entries: {},
       refreshingCacheKeys: new Set<string>(),
       hasQueuedPersist: false,
+      metadataPersistDirty: false,
+      pendingAccessedAt: {},
+      activeRequestCount: 0,
+      lastUsedAt: this.now(),
     };
     this.siteStateByKey.set(siteKey, newState);
     return newState;
   }
 
-  // An entry is stale when it is old enough that we want to refresh it before trusting it again.
+  private trimResidentStates(targetSize = MAX_RESIDENT_SITES): void {
+    if (this.siteStateByKey.size <= targetSize) {
+      return;
+    }
+
+    const idleStates = Array.from(this.siteStateByKey.entries())
+      .filter(([siteKey, siteState]) => {
+        return (
+          siteState.activeRequestCount === 0 &&
+          !this.siteQueueByKey.has(siteKey) &&
+          siteState.refreshingCacheKeys.size === 0 &&
+          !siteState.hasQueuedPersist &&
+          !siteState.metadataPersistDirty
+        );
+      })
+      .sort(([, left], [, right]) => left.lastUsedAt - right.lastUsedAt);
+
+    let removedState = false;
+    while (this.siteStateByKey.size > targetSize && idleStates.length > 0) {
+      const [siteKey, siteState] = idleStates.shift()!;
+      if (siteState.residentEvictionTimer) {
+        clearTimeout(siteState.residentEvictionTimer);
+        siteState.residentEvictionTimer = undefined;
+      }
+      this.siteStateByKey.delete(siteKey);
+      removedState = true;
+    }
+
+    if (removedState) {
+      this.wakeResidentAdmissionWaiters();
+    }
+  }
+
+  private async acquireSiteState(siteKey: string): Promise<SiteCacheState> {
+    while (true) {
+      const existingState = this.siteStateByKey.get(siteKey);
+      if (existingState) {
+        existingState.activeRequestCount += 1;
+        this.touchSiteState(existingState);
+        return existingState;
+      }
+
+      this.trimResidentStates(MAX_RESIDENT_SITES - 1);
+      if (this.siteStateByKey.size < MAX_RESIDENT_SITES) {
+        const siteState = this.getOrCreateSiteState(siteKey);
+        siteState.activeRequestCount += 1;
+        this.touchSiteState(siteState);
+        return siteState;
+      }
+
+      await this.waitForResidentCapacity();
+    }
+  }
+
+  private async waitForResidentCapacity(): Promise<void> {
+    await new Promise<void>((resolve, reject) => {
+      const waiter = () => {
+        clearTimeout(timer);
+        this.residentAdmissionWaiters.delete(waiter);
+        resolve();
+      };
+      const timer = setTimeout(() => {
+        this.residentAdmissionWaiters.delete(waiter);
+        reject(new HttpError(503, "CACHE_BUSY", "Timed out waiting for cache capacity."));
+      }, this.config.fetchTimeoutMs);
+      this.residentAdmissionWaiters.add(waiter);
+    });
+  }
+
+  private wakeResidentAdmissionWaiters(): void {
+    const waiters = Array.from(this.residentAdmissionWaiters);
+    this.residentAdmissionWaiters.clear();
+    for (const waiter of waiters) {
+      waiter();
+    }
+  }
+
+  private releaseSiteState(
+    siteKey: string,
+    siteState: SiteCacheState,
+    resolveFailed = false,
+  ): void {
+    siteState.activeRequestCount = Math.max(0, siteState.activeRequestCount - 1);
+    if (
+      resolveFailed &&
+      Object.keys(siteState.entries).length === 0 &&
+      this.siteQueueByKey.has(siteKey) === false &&
+      this.siteStateByKey.get(siteKey) === siteState
+    ) {
+      this.siteStateByKey.delete(siteKey);
+      this.wakeResidentAdmissionWaiters();
+      return;
+    }
+    this.trimResidentStates(
+      this.residentAdmissionWaiters.size > 0 ? MAX_RESIDENT_SITES - 1 : MAX_RESIDENT_SITES,
+    );
+    this.scheduleResidentEviction(siteKey, siteState);
+  }
+
+  private touchSiteState(siteState: SiteCacheState, at = this.now()): void {
+    siteState.lastUsedAt = Math.max(siteState.lastUsedAt, at);
+    if (siteState.residentEvictionTimer) {
+      clearTimeout(siteState.residentEvictionTimer);
+      siteState.residentEvictionTimer = undefined;
+    }
+  }
+
+  private getEffectiveEntry(
+    siteState: SiteCacheState,
+    cacheKey: string,
+  ): CacheEntryState | undefined {
+    const entry = siteState.entries[cacheKey];
+    if (!entry) {
+      return undefined;
+    }
+
+    const pendingAccessedAt = siteState.pendingAccessedAt[cacheKey];
+    if (pendingAccessedAt === undefined || pendingAccessedAt <= entry.lastAccessedAt) {
+      return entry;
+    }
+
+    return {
+      body: entry.body,
+      updatedAt: entry.updatedAt,
+      lastAccessedAt: pendingAccessedAt,
+    };
+  }
+
+  private recordAccess(
+    siteState: SiteCacheState,
+    siteKey: string,
+    cacheKey: string,
+    accessedAt: number,
+  ): void {
+    this.touchSiteState(siteState, accessedAt);
+    const previousAccessedAt = siteState.pendingAccessedAt[cacheKey];
+    if (previousAccessedAt === undefined || accessedAt > previousAccessedAt) {
+      siteState.pendingAccessedAt[cacheKey] = accessedAt;
+    }
+    siteState.metadataPersistDirty = true;
+    this.scheduleMetadataPersist(siteKey);
+  }
+
   private isEntryStale(entry: CacheEntryState, currentTime: number): boolean {
     return currentTime - entry.updatedAt >= this.config.staleAfterMs;
   }
 
-  // Removes entries that have not been accessed for longer than the eviction window.
-  // This keeps disk usage bounded and drops cache rows that are no longer worth keeping.
-  private removeExpiredEntries(siteState: SiteCacheState, currentTime: number): number {
+  private isEntryExpired(entry: CacheEntryState, currentTime: number): boolean {
+    return currentTime - entry.lastAccessedAt >= this.config.evictAfterMs;
+  }
+
+  private removeExpiredEntries(
+    entries: Record<string, CacheEntryState>,
+    currentTime: number,
+  ): number {
     let removedEntries = 0;
 
-    for (const [cacheKey, entry] of Object.entries(siteState.entries)) {
-      if (currentTime - entry.lastAccessedAt <= this.config.evictAfterMs) {
+    for (const [cacheKey, entry] of Object.entries(entries)) {
+      if (!this.isEntryExpired(entry, currentTime)) {
         continue;
       }
 
-      delete siteState.entries[cacheKey];
+      delete entries[cacheKey];
       removedEntries += 1;
     }
 
     return removedEntries;
   }
 
-  // Writes the current in-memory snapshot to disk through the persistence layer.
-  private async persistSiteSnapshot(
-    siteKey: string,
-    siteState: SiteCacheState,
-    savedAt: number,
-  ): Promise<void> {
-    await this.persistence.saveSiteSnapshot(siteKey, siteState.entries, savedAt);
+  private trimEntriesToCap(
+    entries: Record<string, CacheEntryState>,
+    protectedCacheKey?: string,
+  ): number {
+    let count = Object.keys(entries).length;
+    const entrySizes = new Map(Object.entries(entries).map(([key, entry]) => [key, Buffer.byteLength(JSON.stringify({ [key]: entry }))]));
+    let bytes = Array.from(entrySizes.values()).reduce((sum, size) => sum + size, 0);
+    // Leave room for the snapshot envelope and site key.
+    const maxBytes = MAX_SNAPSHOT_BYTES - 1024;
+    if (count <= MAX_ENTRIES_PER_SITE && bytes <= maxBytes) {
+      return 0;
+    }
+
+    const oldestEntries = Object.entries(entries)
+      .filter(([cacheKey]) => cacheKey !== protectedCacheKey)
+      .sort(([leftKey, leftEntry], [rightKey, rightEntry]) => {
+        const accessDifference = leftEntry.lastAccessedAt - rightEntry.lastAccessedAt;
+        if (accessDifference !== 0) {
+          return accessDifference;
+        }
+
+        return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
+      });
+
+    let removed = 0;
+    for (const [cacheKey] of oldestEntries) {
+      if (count <= MAX_ENTRIES_PER_SITE && bytes <= maxBytes) break;
+      bytes -= entrySizes.get(cacheKey)!;
+      count--;
+      removed++;
+      delete entries[cacheKey];
+    }
+
+    if (bytes > maxBytes) throw new HttpError(502, "CACHE_TOO_LARGE", "The cache entry exceeds the snapshot budget.");
+    return removed;
   }
 
-  // Metadata-only writes are queued so a burst of reads does not cause a burst of disk writes.
+  private mergePendingAccesses(
+    prior: Record<string, number>,
+    concurrent: Record<string, number>,
+  ): Record<string, number> {
+    const merged = { ...prior };
+    for (const [cacheKey, accessedAt] of Object.entries(concurrent)) {
+      merged[cacheKey] = Math.max(merged[cacheKey] ?? Number.NEGATIVE_INFINITY, accessedAt);
+    }
+    return merged;
+  }
+
+  private buildWorkingEntries(siteState: SiteCacheState): Record<string, CacheEntryState> {
+    const entries = this.cloneEntries(siteState.entries);
+
+    for (const [cacheKey, pendingAccessedAt] of Object.entries(siteState.pendingAccessedAt)) {
+      const entry = entries[cacheKey];
+      if (entry && pendingAccessedAt > entry.lastAccessedAt) {
+        entry.lastAccessedAt = pendingAccessedAt;
+      }
+    }
+
+    return entries;
+  }
+
+  private cloneEntries(
+    entries: Record<string, CacheEntryState>,
+  ): Record<string, CacheEntryState> {
+    return structuredClone(entries);
+  }
+
+  private async persistSiteSnapshot(
+    siteKey: string,
+    entries: Record<string, CacheEntryState>,
+    savedAt: number,
+    protectedCacheKey?: string,
+  ): Promise<void> {
+    this.trimEntriesToCap(entries, protectedCacheKey);
+    await this.persistence.saveSiteSnapshot(siteKey, entries, savedAt);
+  }
+
+  /**
+   * Persist a staged map and make it resident only after the write succeeds.
+   * Accesses that arrive while persistence is in flight remain in a separate
+   * map and are therefore not overwritten by this commit.
+   */
+  private async saveCandidateAndCommit(
+    siteKey: string,
+    siteState: SiteCacheState,
+    candidateEntries: Record<string, CacheEntryState>,
+    savedAt: number,
+    protectedCacheKey?: string,
+  ): Promise<void> {
+    const priorPendingAccesses = siteState.pendingAccessedAt;
+    siteState.pendingAccessedAt = {};
+    siteState.metadataPersistDirty = false;
+
+    try {
+      await this.persistSiteSnapshot(siteKey, candidateEntries, savedAt, protectedCacheKey);
+    } catch (error) {
+      // Keep the old resident entries and retain metadata from before and
+      // during the failed write. A later hit-triggered write can retry it.
+      siteState.pendingAccessedAt = this.mergePendingAccesses(
+        priorPendingAccesses,
+        siteState.pendingAccessedAt,
+      );
+      siteState.metadataPersistDirty = true;
+      throw error;
+    }
+
+    siteState.entries = candidateEntries;
+    siteState.loaded = true;
+    for (const [cacheKey, pendingAccessedAt] of Object.entries(siteState.pendingAccessedAt)) {
+      const committedEntry = candidateEntries[cacheKey];
+      if (!committedEntry || pendingAccessedAt <= committedEntry.lastAccessedAt) {
+        delete siteState.pendingAccessedAt[cacheKey];
+      }
+    }
+    siteState.metadataPersistDirty = Object.keys(siteState.pendingAccessedAt).length > 0;
+  }
+
   private scheduleMetadataPersist(siteKey: string): void {
     const siteState = this.getOrCreateSiteState(siteKey);
+    siteState.metadataPersistDirty = true;
     if (siteState.hasQueuedPersist) {
       return;
     }
 
     siteState.hasQueuedPersist = true;
 
-    void this.runWithSiteLock(siteKey, async () => {
+    const queuedWork = this.runWithSiteLock(siteKey, async () => {
+      let persisted = false;
+
       try {
         const lockedSiteState = await this.loadSiteSnapshotIfNeeded(siteKey);
+        if (
+          !lockedSiteState.metadataPersistDirty &&
+          Object.keys(lockedSiteState.pendingAccessedAt).length === 0
+        ) {
+          return;
+        }
+
         const currentTime = this.now();
-        this.removeExpiredEntries(lockedSiteState, currentTime);
-        await this.persistSiteSnapshot(siteKey, lockedSiteState, currentTime);
+        const candidateEntries = this.buildWorkingEntries(lockedSiteState);
+        this.removeExpiredEntries(candidateEntries, currentTime);
+        this.trimEntriesToCap(candidateEntries);
+        await this.saveCandidateAndCommit(
+          siteKey,
+          lockedSiteState,
+          candidateEntries,
+          currentTime,
+        );
+        persisted = true;
       } catch (error) {
         this.logger.error("Failed to persist cache access metadata.", {
           siteKey,
@@ -253,12 +604,29 @@ export class AirtableCacheStore {
         });
       } finally {
         siteState.hasQueuedPersist = false;
+
+        // Capture at most one follow-up per completed write.  This records an
+        // access that raced the write without spinning in a loop while hits
+        // continue to arrive.
+        if (
+          persisted &&
+          siteState.metadataPersistDirty &&
+          Object.keys(siteState.pendingAccessedAt).length > 0
+        ) {
+          this.scheduleMetadataPersist(siteKey);
+        }
       }
     });
+
+    // Reconcile lifecycle state after the whole queued operation settles. The
+    // lock's finally block runs before this promise settles, but an admission
+    // waiter must also see the flags cleared by the task callback itself.
+    void queuedWork.then(
+      () => this.reconcileResidentAdmission(siteKey, siteState),
+      () => this.reconcileResidentAdmission(siteKey, siteState),
+    );
   }
 
-  // Background refresh keeps stale hits fast by serving the old value first
-  // and quietly replacing it after the lock is available.
   private scheduleBackgroundRefresh(
     siteKey: string,
     cacheKey: string,
@@ -271,28 +639,43 @@ export class AirtableCacheStore {
 
     siteState.refreshingCacheKeys.add(cacheKey);
 
-    void this.runWithSiteLock(siteKey, async () => {
+    const queuedWork = this.runWithSiteLock(siteKey, async () => {
       try {
         const lockedSiteState = await this.loadSiteSnapshotIfNeeded(siteKey);
-        const existingEntry = lockedSiteState.entries[cacheKey];
-        if (!existingEntry) {
-          return;
-        }
-
         const currentTime = this.now();
-        if (!this.isEntryStale(existingEntry, currentTime)) {
+        const lockedEntries = this.buildWorkingEntries(lockedSiteState);
+        this.removeExpiredEntries(lockedEntries, currentTime);
+        this.trimEntriesToCap(lockedEntries);
+        const existingEntry = lockedEntries[cacheKey];
+        if (!existingEntry || !this.isEntryStale(existingEntry, currentTime)) {
           return;
         }
 
         const freshResponse = await this.client.fetchMergedResponse(airtableUrl);
-        lockedSiteState.entries[cacheKey] = {
-          body: freshResponse.body,
-          updatedAt: currentTime,
-          lastAccessedAt: existingEntry.lastAccessedAt,
-        };
+        const completedAt = this.now();
+        this.touchSiteState(lockedSiteState, completedAt);
+        const candidateEntries = this.buildWorkingEntries(lockedSiteState);
+        this.removeExpiredEntries(candidateEntries, completedAt);
+        this.trimEntriesToCap(candidateEntries);
+        const refreshedEntry = candidateEntries[cacheKey];
 
-        this.removeExpiredEntries(lockedSiteState, currentTime);
-        await this.persistSiteSnapshot(siteKey, lockedSiteState, currentTime);
+        // If the stale entry aged out while the upstream request was in
+        // flight, do not resurrect it merely because refresh completed.
+        if (!refreshedEntry) {
+          return;
+        }
+
+        candidateEntries[cacheKey] = {
+          body: structuredClone(freshResponse.body),
+          updatedAt: completedAt,
+          lastAccessedAt: Math.max(existingEntry.lastAccessedAt, refreshedEntry.lastAccessedAt),
+        };
+        await this.saveCandidateAndCommit(
+          siteKey,
+          lockedSiteState,
+          candidateEntries,
+          completedAt,
+        );
       } catch (error) {
         this.logger.error("Background refresh failed. Serving the last good cache entry.", {
           siteKey,
@@ -302,12 +685,20 @@ export class AirtableCacheStore {
       } finally {
         siteState.refreshingCacheKeys.delete(cacheKey);
       }
-      });
+    });
+
+    // Re-run admission reconciliation after the background task has settled,
+    // including after its refresh marker is removed in the task finally.
+    void queuedWork.then(
+      () => this.reconcileResidentAdmission(siteKey, siteState),
+      () => this.reconcileResidentAdmission(siteKey, siteState),
+    );
   }
 
-  // This helper is the per-site lock.
-  // It chains work so only one task for a site runs at a time in this process.
   private async runWithSiteLock<T>(siteKey: string, task: () => Promise<T>): Promise<T> {
+    const siteState = this.getOrCreateSiteState(siteKey);
+    this.touchSiteState(siteState);
+
     const previousQueuedTask = this.siteQueueByKey.get(siteKey) ?? Promise.resolve();
     let releaseCurrentQueueSlot: (() => void) | undefined;
     const currentQueueSlot = new Promise<void>((resolve) => {
@@ -318,7 +709,6 @@ export class AirtableCacheStore {
       .then(() => currentQueueSlot);
     this.siteQueueByKey.set(siteKey, updatedQueueTail);
 
-    // Promise chaining provides a simple per-site single-flight lock for this single-process VM.
     await previousQueuedTask.catch(() => undefined);
 
     try {
@@ -334,21 +724,95 @@ export class AirtableCacheStore {
       if (this.siteQueueByKey.get(siteKey) === updatedQueueTail) {
         this.siteQueueByKey.delete(siteKey);
       }
+      this.reconcileResidentAdmission(siteKey, siteState);
     }
   }
 
-  // Waits until the current promise chain for one site has finished draining.
-  private async waitForSiteQueueToDrain(siteKey: string): Promise<void> {
-    let currentQueuedTask = this.siteQueueByKey.get(siteKey);
+  private reconcileResidentAdmission(siteKey: string, siteState: SiteCacheState): void {
+    this.scheduleResidentEviction(siteKey, siteState);
+    this.trimResidentStates(
+      this.residentAdmissionWaiters.size > 0 ? MAX_RESIDENT_SITES - 1 : MAX_RESIDENT_SITES,
+    );
+  }
 
-    while (currentQueuedTask) {
-      await currentQueuedTask.catch(() => undefined);
-      const nextQueuedTask = this.siteQueueByKey.get(siteKey);
-      if (!nextQueuedTask || nextQueuedTask === currentQueuedTask) {
+  private async waitForSiteQueueToDrain(siteKey: string): Promise<void> {
+    while (true) {
+      const queuedWork = this.siteQueueByKey.get(siteKey);
+      if (!queuedWork) {
         return;
       }
 
-      currentQueuedTask = nextQueuedTask;
+      await queuedWork.catch(() => undefined);
+
+      if (this.siteQueueByKey.get(siteKey) === queuedWork) {
+        return;
+      }
     }
+  }
+
+  private scheduleResidentEviction(siteKey: string, state?: SiteCacheState): void {
+    const siteState = state ?? this.siteStateByKey.get(siteKey);
+    if (!siteState || this.siteStateByKey.get(siteKey) !== siteState) {
+      return;
+    }
+
+    if (siteState.residentEvictionTimer) {
+      clearTimeout(siteState.residentEvictionTimer);
+      siteState.residentEvictionTimer = undefined;
+    }
+
+    if (
+      siteState.activeRequestCount > 0 ||
+      this.siteQueueByKey.has(siteKey) ||
+      siteState.refreshingCacheKeys.size > 0 ||
+      siteState.hasQueuedPersist
+    ) {
+      return;
+    }
+
+    if (siteState.metadataPersistDirty) {
+      // Retain failed access writes and retry without spinning or losing them to LRU pressure.
+      siteState.residentEvictionTimer = setTimeout(() => this.scheduleMetadataPersist(siteKey), 1_000);
+      siteState.residentEvictionTimer.unref?.();
+      return;
+    }
+
+    const entryCount = Object.keys(siteState.entries).length;
+    if (!siteState.loaded) {
+      this.siteStateByKey.delete(siteKey);
+      this.wakeResidentAdmissionWaiters();
+      return;
+    }
+
+    const currentTime = this.now();
+    if (
+      entryCount > 0 &&
+      Object.values(siteState.entries).every((entry) => this.isEntryExpired(entry, currentTime))
+    ) {
+      // The durable snapshot is deliberately left untouched.  A later
+      // request can reload it and perform normal cleanup/fetch behavior.
+      this.siteStateByKey.delete(siteKey);
+      this.wakeResidentAdmissionWaiters();
+      return;
+    }
+
+    const age = Math.max(0, currentTime - siteState.lastUsedAt);
+    const remainingMs = this.config.evictAfterMs - age;
+    if (remainingMs <= 0) {
+      this.siteStateByKey.delete(siteKey);
+      this.wakeResidentAdmissionWaiters();
+      return;
+    }
+    const delayMs = Math.max(1, Math.min(remainingMs, MAX_TIMER_DELAY_MS));
+    siteState.residentEvictionTimer = setTimeout(() => {
+      siteState.residentEvictionTimer = undefined;
+      this.scheduleResidentEviction(siteKey, siteState);
+    }, delayMs);
+
+    // Timers should not keep a short-lived worker alive solely to release a
+    // cache object.  Node's Timeout exposes unref; browser-like test timers do
+    // not, hence the guarded call.
+    const timer = siteState.residentEvictionTimer as unknown as { unref?: () => void };
+    timer.unref?.();
   }
 }
