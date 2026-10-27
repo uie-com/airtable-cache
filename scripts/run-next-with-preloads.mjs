@@ -1,7 +1,6 @@
+import { promises as fileSystem } from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
-
-import { reconcileDerivedPreloadFilesFromSnapshots } from "./prepare-preloads.mjs";
 
 const mode = process.argv[2];
 
@@ -10,7 +9,34 @@ if (mode !== "dev" && mode !== "start") {
   process.exit(1);
 }
 
-await reconcileDerivedPreloadFilesFromSnapshots();
+async function removeObsoletePublicPreloads() {
+  const publicDirectory = path.join(process.cwd(), "public");
+  let entries;
+  try {
+    entries = await fileSystem.readdir(publicDirectory, { withFileTypes: true });
+  } catch (error) {
+    if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
+      return;
+    }
+    throw error;
+  }
+
+  const obsoleteFiles = [];
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.startsWith("cache-") || !entry.name.endsWith(".js")) continue;
+    const artifactPath = path.join(publicDirectory, entry.name);
+    const contents = await fileSystem.readFile(artifactPath, "utf8");
+    if (!contents.includes("export const cache =") || !contents.includes("window.airtableCache = cache;")) continue;
+    await fileSystem.rm(artifactPath);
+    await fileSystem.rm(path.join(publicDirectory, `timestamps-${entry.name.slice(6, -3)}.json`), { force: true });
+    obsoleteFiles.push(entry.name);
+  }
+  if (obsoleteFiles.length > 0) {
+    console.info(`[airtable-startup] Removed ${obsoleteFiles.length} obsolete public preload artifact(s).`);
+  }
+}
+
+await removeObsoletePublicPreloads();
 
 const nextBinaryPath = path.join(process.cwd(), "node_modules", "next", "dist", "bin", "next");
 const port = process.env.PORT?.trim() || "4444";

@@ -88,6 +88,63 @@ describe("airtable client", () => {
     });
   });
 
+  it("maps response-body timeouts and stream failures to stable upstream errors", async () => {
+    const workspace = createTempWorkspace();
+    workspaceRoots.push(workspace.rootDir);
+
+    const timeoutResponse = new Response(new ReadableStream({
+      start(controller) { controller.error(new DOMException("The operation timed out.", "TimeoutError")); },
+    }));
+    const networkResponse = new Response(new ReadableStream({
+      start(controller) { controller.error(new TypeError("socket closed")); },
+    }));
+
+    const timeoutClient = new AirtableClient(
+      createTestConfig(workspace),
+      testLogger,
+      vi.fn<typeof fetch>().mockResolvedValue(timeoutResponse),
+    );
+    const networkClient = new AirtableClient(
+      createTestConfig(workspace),
+      testLogger,
+      vi.fn<typeof fetch>().mockResolvedValue(networkResponse),
+    );
+
+    await expect(timeoutClient.fetchMergedResponse(EXAMPLE_TOPICS_URL)).rejects.toMatchObject({
+      status: 504,
+      code: "AIRTABLE_TIMEOUT",
+    });
+    await expect(networkClient.fetchMergedResponse(EXAMPLE_TOPICS_URL)).rejects.toMatchObject({
+      status: 502,
+      code: "AIRTABLE_NETWORK_ERROR",
+      details: {
+        cause: "socket closed",
+      },
+    });
+  });
+
+  it.each([null, 42, ""]) (
+    "rejects a present invalid Airtable pagination offset: %j",
+    async (offset) => {
+      const workspace = createTempWorkspace();
+      workspaceRoots.push(workspace.rootDir);
+
+      const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
+        createJsonResponse({
+          records: [],
+          offset,
+        }),
+      );
+      const client = new AirtableClient(createTestConfig(workspace), testLogger, fetchMock);
+
+      await expect(client.fetchMergedResponse(EXAMPLE_PUBLISHED_DATES_URL)).rejects.toMatchObject({
+        status: 502,
+        code: "AIRTABLE_INVALID_PAGINATION",
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    },
+  );
+
   it("rejects paginated responses without records arrays", async () => {
     const workspace = createTempWorkspace();
     workspaceRoots.push(workspace.rootDir);

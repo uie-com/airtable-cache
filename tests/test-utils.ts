@@ -8,6 +8,7 @@ import { AirtableConfig, JsonObject, Logger, SiteSnapshot } from "@/lib/airtable
 export interface TestWorkspace {
   rootDir: string;
   publicDir: string;
+  preloadDir: string;
   dataDir: string;
 }
 
@@ -20,30 +21,35 @@ export const testLogger: Logger = {
 export function createTempWorkspace(): TestWorkspace {
   const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), "airtable-cache-"));
   const publicDir = path.join(rootDir, "public");
+  const preloadDir = path.join(rootDir, "preloads");
   const dataDir = path.join(rootDir, "data", "cache");
 
   fs.mkdirSync(publicDir, { recursive: true });
   fs.mkdirSync(dataDir, { recursive: true });
+  fs.mkdirSync(preloadDir, { recursive: true });
 
   return {
     rootDir,
     publicDir,
+    preloadDir,
     dataDir,
   };
 }
 
-export function cleanupTempWorkspace(workspace: TestWorkspace): void {
+export function cleanupTempWorkspace(
+  workspace: Pick<TestWorkspace, "rootDir"> & Partial<TestWorkspace>,
+): void {
   fs.rmSync(workspace.rootDir, { recursive: true, force: true });
 }
 
 export function createTestConfig(
-  workspace: TestWorkspace,
+  workspace: Pick<TestWorkspace, "rootDir" | "dataDir"> & Partial<Pick<TestWorkspace, "preloadDir">>,
   overrides: Partial<AirtableConfig> = {},
 ): AirtableConfig {
   return {
     apiKey: "test-airtable-key",
     cacheDataDir: workspace.dataDir,
-    publicCacheDir: workspace.publicDir,
+    preloadCacheDir: workspace.preloadDir ?? path.join(workspace.rootDir, "preloads"),
     staleAfterMs: 15 * 60 * 1000,
     evictAfterMs: 72 * 60 * 60 * 1000,
     fetchTimeoutMs: 5_000,
@@ -63,15 +69,13 @@ export function createJsonResponse(body: JsonObject, init: ResponseInit = {}): R
 
 export function readPreloadCache(filePath: string): Record<string, JsonObject> {
   const fileContents = fs.readFileSync(filePath, "utf8");
-  const match = fileContents.match(
-    /export const cache =\s*(\{[\s\S]*\})\s*;\s*window\.airtableCache = cache;?\s*$/,
-  );
+  const match = fileContents.match(/export const cache = JSON\.parse\(("(?:[^"\\]|\\.)*")\);\s*window\.airtableCache = cache;?\s*$/);
 
   if (!match) {
     throw new Error(`Invalid preload format in ${filePath}`);
   }
 
-  return JSON.parse(match[1]) as Record<string, JsonObject>;
+  return JSON.parse(JSON.parse(match[1])) as Record<string, JsonObject>;
 }
 
 export function writeSnapshot(

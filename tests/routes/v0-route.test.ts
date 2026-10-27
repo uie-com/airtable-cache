@@ -1,7 +1,7 @@
 import { NextRequest } from "next/server";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { GET } from "@/app/v0/[[...path]]/route";
+import { GET, OPTIONS } from "@/app/v0/[[...path]]/route";
 import { HttpError } from "@/lib/airtable-cache/errors";
 import { createAirtableCacheService } from "@/lib/airtable-cache/service";
 import * as airtableServiceModule from "@/lib/airtable-cache/service";
@@ -55,6 +55,8 @@ describe("/v0 route", () => {
 
     expect(response.status).toBe(200);
     expect(response.headers.get("X-Airtable-Cache")).toBe("miss");
+    expect(response.headers.get("Access-Control-Allow-Origin")).toBe("*");
+    expect(response.headers.get("Access-Control-Expose-Headers")).toBe("X-Airtable-Cache");
     await expect(response.json()).resolves.toEqual(EXAMPLE_PUBLISHED_DATES_BODY);
   });
 
@@ -64,6 +66,8 @@ describe("/v0 route", () => {
     );
 
     expect(response.status).toBe(400);
+    expect(response.headers.get("Access-Control-Allow-Origin")).toBe("*");
+    expect(response.headers.get("Access-Control-Expose-Headers")).toBe("X-Airtable-Cache");
     await expect(response.json()).resolves.toEqual({
       error: {
         code: "INVALID_REF",
@@ -105,6 +109,8 @@ describe("/v0 route", () => {
       },
     });
     expect(genericResponse.status).toBe(500);
+    expect(timeoutResponse.headers.get("Access-Control-Allow-Origin")).toBe("*");
+    expect(genericResponse.headers.get("Access-Control-Allow-Origin")).toBe("*");
     await expect(genericResponse.json()).resolves.toEqual({
       error: {
         code: "INTERNAL_ERROR",
@@ -114,5 +120,15 @@ describe("/v0 route", () => {
         },
       },
     });
+  });
+
+  it("responds to browser preflight requests with CORS headers", async () => {
+    const response = OPTIONS();
+
+    expect(response.status).toBe(204);
+    expect(response.headers.get("Access-Control-Allow-Origin")).toBe("*");
+    expect(response.headers.get("Access-Control-Allow-Methods")).toBe("GET, OPTIONS");
+    expect(response.headers.get("Access-Control-Allow-Headers")).toBe("Content-Type");
+    expect(response.headers.get("Access-Control-Expose-Headers")).toBe("X-Airtable-Cache");
   });
 });

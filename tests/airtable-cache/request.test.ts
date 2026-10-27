@@ -16,7 +16,21 @@ import {
 describe("airtable request parsing", () => {
   it("accepts hostname-style refs and creates filesystem-safe preload names", () => {
     expect(normalizeSiteKey("Example.com")).toBe("example.com");
-    expect(siteKeyToFileToken("localhost:3000")).toBe("localhost_3000");
+    expect(siteKeyToFileToken("localhost_3000")).toBe("localhost_3000");
+    expect(siteKeyToFileToken("localhost:3000")).toBe("localhost~3000");
+    expect(siteKeyToFileToken("localhost:3000")).not.toBe(
+      siteKeyToFileToken("localhost_3000"),
+    );
+    expect(siteKeyToFileToken("localhost:3000")).toMatch(/^[A-Za-z0-9._~-]+$/);
+  });
+
+  it("bounds tokens for maximum-length refs", () => {
+    const longRef = `${"a".repeat(249)}:12345`;
+    const token = siteKeyToFileToken(longRef);
+
+    expect(token.length).toBeLessThanOrEqual(246);
+    expect(token).toMatch(/^[A-Za-z0-9._~-]+$/);
+    expect(token).not.toBe(siteKeyToFileToken(`${"a".repeat(255)}`));
   });
 
   it("rejects full URLs passed as refs", () => {
@@ -111,6 +125,35 @@ describe("airtable request parsing", () => {
     expect(parsedRequest.forceRefresh).toBe(false);
     expect(parsedRequest.airtableUrl).toContain(
       "https://api.airtable.com/v0/appHcZTzlfXAJpL7I/tblVtIK7hg8LOJfZd?",
+    );
+  });
+
+  it.each([
+    ["Table%20Name", "Table%20Name"],
+    ["%E2%9C%93", "%E2%9C%93"],
+    ["100%25Ready", "100%25Ready"],
+  ])("encodes an already-encoded table segment exactly once (%s)", (segment, encodedSegment) => {
+    const request = new NextRequest(
+      `http://localhost:4444/v0/app123/${segment}?ref=${EXAMPLE_SITE_KEY}`,
+    );
+
+    expect(buildAirtableProxyRequest(request).airtableUrl).toBe(
+      `https://api.airtable.com/v0/app123/${encodedSegment}`,
+    );
+  });
+
+  it("rejects malformed percent escapes in Airtable path segments", () => {
+    expect(() =>
+      buildAirtableProxyRequest(
+        new NextRequest(
+          `http://localhost:4444/v0/app123/Table%ZZ?ref=${EXAMPLE_SITE_KEY}`,
+        ),
+      ),
+    ).toThrowError(
+      expect.objectContaining({
+        status: 400,
+        code: "INVALID_AIRTABLE_PATH",
+      }),
     );
   });
 

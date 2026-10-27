@@ -2,6 +2,7 @@ import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
+import { runInNewContext } from "node:vm";
 
 import { NextRequest } from "next/server";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -20,6 +21,7 @@ import {
 
 const TEST_TIMEOUT_MS = 180_000;
 const REGRESSION_SITE_KEY = "regression-static-preload.test";
+const ENCODED_REQUEST = "/v0/appEncoded/Table%20Name%2F%E2%9C%93?fields%5B%5D=Title&fields%5B%5D=Name&view=Grid+view";
 
 interface RunningBuiltApp {
   baseUrl: string;
@@ -105,7 +107,6 @@ async function findOpenPort(): Promise<number> {
 async function startBuiltNextApp(
   workspace: TestWorkspace,
   airtableBaseUrl: string,
-  publicDirectory: string,
 ): Promise<RunningBuiltApp> {
   const port = await findOpenPort();
   const childProcess = spawn(
@@ -118,7 +119,7 @@ async function startBuiltNextApp(
         AIRTABLE_API_BASE_URL: airtableBaseUrl,
         AIRTABLE_API_KEY: "regression-airtable-key",
         CACHE_DATA_DIR: workspace.dataDir,
-        CACHE_PUBLIC_DIR: publicDirectory,
+        CACHE_PRELOAD_DIR: workspace.preloadDir,
         CI: "1",
         HOST: "127.0.0.1",
         NEXT_TELEMETRY_DISABLED: "1",
@@ -168,9 +169,9 @@ async function startAirtableStub(): Promise<AirtableStub> {
   const server = http.createServer((request, response) => {
     const requestUrl = new URL(request.url ?? "/", `http://127.0.0.1:${port}`);
 
-    if (requestUrl.pathname !== requestPath) {
+    if (request.url !== ENCODED_REQUEST && requestUrl.pathname !== requestPath) {
       response.writeHead(404, { "Content-Type": "application/json" });
-      response.end(JSON.stringify({ error: { code: "UNKNOWN_UPSTREAM_REQUEST" } }));
+      response.end(JSON.stringify({ error: { code: "UNKNOWN_UPSTREAM_REQUEST", path: request.url } }));
       return;
     }
 
@@ -262,29 +263,35 @@ async function requestHeadersWithCurl(url: string): Promise<HeaderSnapshot> {
   };
 }
 
-describe("restart static preload regression", () => {
+describe("live runtime preload regression", () => {
   let workspace: TestWorkspace;
   let app: RunningBuiltApp;
   let airtableStub: AirtableStub;
-  let publicDirectory: string;
   let preloadPath: string;
+  let obsoletePublicArtifactPath: string;
+  let obsoletePublicPreloadPath: string;
 
   beforeAll(async () => {
     workspace = createTempWorkspace();
     airtableStub = await startAirtableStub();
-    publicDirectory = path.join(process.cwd(), "public");
     preloadPath = path.join(
-      publicDirectory,
+      workspace.preloadDir,
       `cache-${siteKeyToFileToken(REGRESSION_SITE_KEY)}.js`,
     );
+    obsoletePublicArtifactPath = path.join(process.cwd(), "public", "timestamps-legacy:3000.json");
+    obsoletePublicPreloadPath = path.join(process.cwd(), "public", "cache-legacy:3000.js");
 
     fs.rmSync(preloadPath, { force: true });
+    fs.mkdirSync(path.dirname(obsoletePublicArtifactPath), { recursive: true });
+    fs.writeFileSync(obsoletePublicArtifactPath, "{}", "utf8");
+    fs.writeFileSync(obsoletePublicPreloadPath, "export const cache = {};\nwindow.airtableCache = cache;\n", "utf8");
 
     if (!fs.existsSync(path.join(process.cwd(), ".next", "build-manifest.json"))) {
       throw new Error("The static preload regression requires a built app. Run `npm run build` first.");
     }
 
-    app = await startBuiltNextApp(workspace, airtableStub.baseUrl, publicDirectory);
+    app = await startBuiltNextApp(workspace, airtableStub.baseUrl);
+    expect(fs.existsSync(obsoletePublicArtifactPath)).toBe(false);
   }, TEST_TIMEOUT_MS);
 
   afterAll(async () => {
@@ -293,13 +300,17 @@ describe("restart static preload regression", () => {
     if (preloadPath) {
       fs.rmSync(preloadPath, { force: true });
     }
+    if (obsoletePublicArtifactPath) {
+      fs.rmSync(obsoletePublicArtifactPath, { force: true });
+    }
+    if (obsoletePublicPreloadPath) fs.rmSync(obsoletePublicPreloadPath, { force: true });
     if (workspace) {
       cleanupTempWorkspace(workspace);
     }
   }, TEST_TIMEOUT_MS);
 
   it(
-    "writes the preload during a live request and serves it statically after restart",
+    "serves a preload created after boot without a restart",
     async () => {
       const cacheFileToken = siteKeyToFileToken(REGRESSION_SITE_KEY);
       const proxyPath = buildProxyPath(EXAMPLE_FILTERED_LABS_URL, REGRESSION_SITE_KEY);
@@ -325,9 +336,6 @@ describe("restart static preload regression", () => {
       expect(preloadCache[expectedCacheKey]).toEqual(EXAMPLE_FILTERED_LABS_BODY);
       expect(preloadCache[expectedCacheKey]).not.toHaveProperty("offset");
 
-      await app.stop();
-      app = await startBuiltNextApp(workspace, airtableStub.baseUrl, publicDirectory);
-
       const staticHeaders = await requestHeadersWithCurl(
         `${app.baseUrl}/cache-${cacheFileToken}.js`,
       );
@@ -336,7 +344,6 @@ describe("restart static preload regression", () => {
       expect(staticHeaders.headers.get("cache-control")).toContain("public");
       expect(staticHeaders.headers.get("content-length")).toBeTruthy();
       expect(staticHeaders.headers.get("last-modified")).toBeTruthy();
-      expect(staticHeaders.headers.get("accept-ranges")).toBe("bytes");
       expect(staticHeaders.headers.get("access-control-allow-origin")).toBe("*");
       expect(staticHeaders.headers.get("access-control-expose-headers")).toContain("Content-Length");
       expect(staticHeaders.headers.get("cross-origin-resource-policy")).toBe("cross-origin");
@@ -346,7 +353,33 @@ describe("restart static preload regression", () => {
 
       expect(preloadResponse.status).toBe(200);
       expect(preloadText).toContain("window.airtableCache = cache;");
+      const etag = preloadResponse.headers.get("etag");
+      expect(etag).toBeTruthy();
+      expect((await fetch(`${app.baseUrl}/cache-${cacheFileToken}.js`, {
+        headers: { "If-None-Match": etag! },
+      })).status).toBe(304);
     },
     TEST_TIMEOUT_MS,
   );
+
+  it("preserves encoded table paths and exact subscriber keys through HTTP and executable preloads", async () => {
+    const response = await fetch(`${app.baseUrl}${ENCODED_REQUEST}&ref=encoded.test`, {
+      headers: { Origin: "https://subscriber.test" },
+    });
+    expect(response.status, await response.clone().text()).toBe(200);
+    expect(response.headers.get("access-control-allow-origin")).toBe("*");
+    expect(await response.json()).toEqual(EXAMPLE_FILTERED_LABS_BODY);
+    const options = await fetch(`${app.baseUrl}${ENCODED_REQUEST}&ref=encoded.test`, {
+      method: "OPTIONS",
+      headers: { Origin: "https://subscriber.test", "Access-Control-Request-Method": "GET", "Access-Control-Request-Headers": "Content-Type" },
+    });
+    expect(options.status).toBe(204);
+    expect(options.headers.get("access-control-allow-headers")).toBe("Content-Type");
+    const preload = await fetch(`${app.baseUrl}/cache-encoded.test.js`);
+    expect(preload.status).toBe(200);
+    const browser: { airtableCache?: Record<string, unknown> } = {};
+    // Execute the published code in a browser-like global, removing only the ESM export keyword.
+    runInNewContext((await preload.text()).replace(/^export /, ""), { window: browser });
+    expect(browser.airtableCache?.[`${airtableStub.baseUrl}${ENCODED_REQUEST}`]).toEqual(EXAMPLE_FILTERED_LABS_BODY);
+  }, TEST_TIMEOUT_MS);
 });

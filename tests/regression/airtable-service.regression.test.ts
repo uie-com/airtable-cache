@@ -291,7 +291,7 @@ async function startNextApp(workspace: TestWorkspace, airtableBaseUrl: string): 
         AIRTABLE_API_KEY: "regression-airtable-key",
         AIRTABLE_FETCH_TIMEOUT_MS: "2000",
         CACHE_DATA_DIR: workspace.dataDir,
-        CACHE_PUBLIC_DIR: workspace.publicDir,
+        CACHE_PRELOAD_DIR: workspace.preloadDir,
         CACHE_STALE_AFTER_MS: String(STALE_AFTER_MS),
         CACHE_EVICT_AFTER_MS: String(EVICT_AFTER_MS),
         CI: "1",
@@ -389,7 +389,7 @@ describe("launched Airtable cache regression", () => {
 
     const cacheFileToken = siteKeyToFileToken(EXAMPLE_SITE_KEY);
     snapshotPath = path.join(workspace.dataDir, `${cacheFileToken}.json`);
-    preloadPath = path.join(workspace.publicDir, `cache-${cacheFileToken}.js`);
+    preloadPath = path.join(workspace.preloadDir, `cache-${cacheFileToken}.js`);
   }, TEST_TIMEOUT_MS);
 
   afterAll(async () => {
